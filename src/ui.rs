@@ -126,22 +126,15 @@ fn render_target_picker(frame: &mut Frame, app: &App) {
     let area = centered_rect(frame.area(), 60, 60);
     frame.render_widget(Clear, area);
 
+    let visible = area.height.saturating_sub(2) as usize;
+    let start = window_start(app.target_cursor, app.target_options.len(), visible);
     let items: Vec<ListItem> = app
         .target_options
         .iter()
-        .skip(window_start(
-            app.target_cursor,
-            app.target_options.len(),
-            area.height.saturating_sub(2) as usize,
-        ))
-        .take(area.height.saturating_sub(2) as usize)
+        .skip(start)
+        .take(visible)
         .enumerate()
         .map(|(offset, target)| {
-            let start = window_start(
-                app.target_cursor,
-                app.target_options.len(),
-                area.height.saturating_sub(2) as usize,
-            );
             let index = start + offset;
             let prefix = if index == app.target_cursor { "> " } else { "  " };
             ListItem::new(format!("{prefix}{}", target.display()))

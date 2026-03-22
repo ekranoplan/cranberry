@@ -47,10 +47,7 @@ impl App {
             source_label: String::new(),
             filter_query: String::new(),
             filter_input_open: false,
-            target_options: vec![TargetFilter {
-                job: String::from("*"),
-                target: String::from("*"),
-            }],
+            target_options: vec![TargetFilter::wildcard()],
             target_selected: 0,
             target_picker_open: false,
             target_cursor: 0,
@@ -242,10 +239,7 @@ impl App {
         self.all_metrics.clear();
         self.metrics.clear();
         self.metric_history.clear();
-        self.target_options = vec![TargetFilter {
-            job: String::from("*"),
-            target: String::from("*"),
-        }];
+        self.target_options = vec![TargetFilter::wildcard()];
         self.target_selected = 0;
         self.target_cursor = 0;
         self.target_picker_open = false;
@@ -279,32 +273,14 @@ impl App {
 
     fn refresh_target_options(&mut self) {
         let previous = self.target_options.get(self.target_selected).cloned();
-        let mut seen = BTreeSet::new();
-        let mut options = vec![TargetFilter {
-            job: String::from("*"),
-            target: String::from("*"),
-        }];
-
-        for metric in &self.all_metrics {
-            let job = label_value(metric, "job");
+        let filters = self.all_metrics.iter().filter_map(|metric| {
+            let job = label_value(metric, "job")?;
             let target = label_value(metric, "instance")
                 .or_else(|| label_value(metric, "target"))
                 .unwrap_or_else(|| String::from("-"));
-            if let Some(job) = job {
-                let filter = TargetFilter { job, target };
-                if seen.insert((filter.job.clone(), filter.target.clone())) {
-                    options.push(filter);
-                }
-            }
-        }
-
-        options[1..].sort_by(|left, right| {
-            left.job
-                .cmp(&right.job)
-                .then_with(|| left.target.cmp(&right.target))
+            Some(TargetFilter { job, target })
         });
-
-        self.target_options = options;
+        self.target_options = build_target_options(filters);
         self.target_selected = previous
             .and_then(|current| self.target_options.iter().position(|item| item == &current))
             .unwrap_or(0);
@@ -312,11 +288,12 @@ impl App {
     }
 
     fn rebuild_metrics_view(&mut self, previous_selection: Option<&MetricKey>) {
+        let needle = self.filter_query.to_lowercase();
         self.metrics = self
             .all_metrics
             .iter()
             .filter(|metric| self.matches_selected_target(metric))
-            .filter(|metric| self.matches_filter(metric))
+            .filter(|metric| self.matches_filter_with(&needle, metric))
             .cloned()
             .collect();
         if let Some(max_metrics) = self.display.max_metrics {
@@ -391,26 +368,32 @@ impl App {
             && metric_target.as_deref() == Some(selected.target.as_str())
     }
 
-    fn matches_filter(&self, metric: &MetricSample) -> bool {
-        if self.filter_query.is_empty() {
+    fn matches_filter_with(&self, needle: &str, metric: &MetricSample) -> bool {
+        if needle.is_empty() {
             return true;
         }
 
-        let needle = self.filter_query.to_lowercase();
-        if metric.name.to_lowercase().contains(&needle) {
+        if metric.name.to_lowercase().contains(needle) {
             return true;
         }
 
         metric
             .labels
             .iter()
-            .any(|(key, value)| format!("{key}={value}").to_lowercase().contains(&needle))
+            .any(|(key, value)| format!("{key}={value}").to_lowercase().contains(needle))
     }
 }
 
 type MetricKey = (String, Vec<(String, String)>);
 
 impl TargetFilter {
+    fn wildcard() -> Self {
+        TargetFilter {
+            job: String::from("*"),
+            target: String::from("*"),
+        }
+    }
+
     pub fn display(&self) -> String {
         if self.job == "*" {
             String::from("all targets")
@@ -452,30 +435,12 @@ fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
         return Err(format!("series status {}", payload.status));
     }
 
-    let mut seen = BTreeSet::new();
-    let mut options = vec![TargetFilter {
-        job: String::from("*"),
-        target: String::from("*"),
-    }];
-
-    for series in payload.data {
-        if let (Some(job), Some(target)) = (series.get("job"), series.get("instance")) {
-            let filter = TargetFilter {
-                job: job.clone(),
-                target: target.clone(),
-            };
-            if seen.insert((filter.job.clone(), filter.target.clone())) {
-                options.push(filter);
-            }
-        }
-    }
-
-    options[1..].sort_by(|left, right| {
-        left.job
-            .cmp(&right.job)
-            .then_with(|| left.target.cmp(&right.target))
+    let filters = payload.data.into_iter().filter_map(|series| {
+        let job = series.get("job")?.clone();
+        let target = series.get("instance")?.clone();
+        Some(TargetFilter { job, target })
     });
-    Ok(options)
+    Ok(build_target_options(filters))
 }
 
 fn fetch_target_metrics(base_url: &str, target: &TargetFilter) -> Result<Vec<MetricSample>, String> {
@@ -563,6 +528,22 @@ impl QuerySample {
 struct SeriesResponse {
     status: String,
     data: Vec<BTreeMap<String, String>>,
+}
+
+fn build_target_options(targets: impl Iterator<Item = TargetFilter>) -> Vec<TargetFilter> {
+    let mut seen = BTreeSet::new();
+    let mut options = vec![TargetFilter::wildcard()];
+    for filter in targets {
+        if seen.insert((filter.job.clone(), filter.target.clone())) {
+            options.push(filter);
+        }
+    }
+    options[1..].sort_by(|left, right| {
+        left.job
+            .cmp(&right.job)
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    options
 }
 
 fn escape_matcher(value: &str) -> String {
