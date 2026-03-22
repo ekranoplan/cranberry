@@ -2,6 +2,8 @@
 
 Cranberry is a Rust TUI dashboard for browsing metrics from Prometheus through the Prometheus HTTP API.
 
+![Cranberry app screenshot](docs/ss.png)
+
 Japanese README: [README-ja.md](README-ja.md)
 
 ## Run
