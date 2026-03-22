@@ -27,8 +27,13 @@ pub fn parse_metrics(input: &str) -> Result<Vec<MetricSample>, String> {
             .parse::<f64>()
             .map_err(|_| format!("invalid value at line {}", index + 1))?;
 
-        let (name, labels) = parse_head(head).map_err(|err| format!("{err} at line {}", index + 1))?;
-        samples.push(MetricSample { name, labels, value });
+        let (name, labels) =
+            parse_head(head).map_err(|err| format!("{err} at line {}", index + 1))?;
+        samples.push(MetricSample {
+            name,
+            labels,
+            value,
+        });
     }
 
     Ok(samples)

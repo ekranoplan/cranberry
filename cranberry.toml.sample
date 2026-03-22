@@ -4,3 +4,7 @@ base_url = "http://127.0.0.1:9090"
 [display]
 initial_metric = "up"
 refresh_secs = 15
+
+[logging]
+path = "cranberry.log"
+level = "info"

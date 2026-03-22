@@ -2,11 +2,14 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph},
+    widgets::{
+        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph,
+        Row, Table,
+    },
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, HistoryView};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let vertical = Layout::default()
@@ -25,16 +28,17 @@ pub fn render(frame: &mut Frame, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  Prometheus TUI Dashboard"),
         Span::raw("  source: "),
-        Span::styled(
-            app.source_label.as_str(),
-            Style::default().fg(Color::Green),
-        ),
+        Span::styled(app.source_label.as_str(), Style::default().fg(Color::Green)),
         Span::raw("  target: "),
         Span::styled(
             app.selected_target().display(),
             Style::default().fg(Color::Yellow),
+        ),
+        Span::raw("  refresh: "),
+        Span::styled(
+            format!("{}s", app.refresh_secs()),
+            Style::default().fg(Color::Blue),
         ),
         Span::raw("  filter: "),
         Span::styled(
@@ -102,14 +106,14 @@ pub fn render(frame: &mut Frame, app: &App) {
         None => String::from("no metrics loaded"),
     };
 
-    let detail = Paragraph::new(detail_text)
-        .block(Block::default().borders(Borders::ALL).title("Details"));
+    let detail =
+        Paragraph::new(detail_text).block(Block::default().borders(Borders::ALL).title("Details"));
     frame.render_widget(detail, detail_layout[0]);
 
-    render_history_chart(frame, app, detail_layout[1]);
+    render_history(frame, app, detail_layout[1]);
 
     let footer = Paragraph::new(format!(
-        "{} | q quit | j/k move | t target picker | / filter | r reload now",
+        "{} | q quit | j/k move | h history view | t target picker | / filter | r reload now",
         app.status
     ))
     .block(Block::default().borders(Borders::ALL).title("Status"));
@@ -136,7 +140,11 @@ fn render_target_picker(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(offset, target)| {
             let index = start + offset;
-            let prefix = if index == app.target_cursor { "> " } else { "  " };
+            let prefix = if index == app.target_cursor {
+                "> "
+            } else {
+                "  "
+            };
             ListItem::new(format!("{prefix}{}", target.display()))
         })
         .collect();
@@ -145,7 +153,9 @@ fn render_target_picker(frame: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("Target Picker")
-            .title_bottom(Line::from("Enter apply | Esc close | j/k move").alignment(Alignment::Center)),
+            .title_bottom(
+                Line::from("Enter apply | Esc close | j/k move").alignment(Alignment::Center),
+            ),
     );
 
     frame.render_widget(picker, area);
@@ -174,11 +184,21 @@ fn render_filter_input(frame: &mut Frame, app: &App) {
     frame.render_widget(prompt, area);
 }
 
+fn render_history(frame: &mut Frame, app: &App, area: Rect) {
+    match app.history_view {
+        HistoryView::Graph => render_history_chart(frame, app, area),
+        HistoryView::Table => render_history_table(frame, app, area),
+    }
+}
+
 fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
     let history = app.selected_metric_history();
     if history.is_empty() {
-        let empty = Paragraph::new("no history yet")
-            .block(Block::default().borders(Borders::ALL).title("History"));
+        let empty = Paragraph::new("no history yet").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("History (Graph)"),
+        );
         frame.render_widget(empty, area);
         return;
     }
@@ -197,31 +217,72 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(index, value)| (index as f64, *value))
         .collect();
     let x_max = points.len().saturating_sub(1) as f64;
-    let datasets = vec![
-        Dataset::default()
-            .name("value")
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&points),
-    ];
+    let datasets = vec![Dataset::default()
+        .name("value")
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&points)];
 
     let chart = Chart::new(datasets)
-        .block(Block::default().borders(Borders::ALL).title("History"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("History (Graph)"),
+        )
         .x_axis(
             Axis::default()
                 .bounds([0.0, x_max.max(1.0)])
                 .labels(vec![Line::from("old"), Line::from("now")]),
         )
-        .y_axis(
-            Axis::default()
-                .bounds([min, max])
-                .labels(vec![
-                    Line::from(format!("{min:.3}")),
-                    Line::from(format!("{max:.3}")),
-                ]),
-        );
+        .y_axis(Axis::default().bounds([min, max]).labels(vec![
+            Line::from(format!("{min:.3}")),
+            Line::from(format!("{max:.3}")),
+        ]));
 
     frame.render_widget(chart, area);
+}
+
+fn render_history_table(frame: &mut Frame, app: &App, area: Rect) {
+    let history = app.selected_metric_history();
+    if history.is_empty() {
+        let empty = Paragraph::new("no history yet").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("History (Table)"),
+        );
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let visible_rows = area.height.saturating_sub(3) as usize;
+    let start = history.len().saturating_sub(visible_rows.max(1));
+    let rows: Vec<Row> = history
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(index, value)| {
+            let age = history.len().saturating_sub(index + 1);
+            let point = if age == 0 {
+                String::from("now")
+            } else {
+                format!("-{age}")
+            };
+            Row::new(vec![Cell::from(point), Cell::from(format!("{value:.3}"))])
+        })
+        .collect();
+
+    let table = Table::new(rows, [Constraint::Length(8), Constraint::Min(12)])
+        .header(
+            Row::new(vec!["Sample", "Value"]).style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("History (Table)"),
+        )
+        .column_spacing(1);
+
+    frame.render_widget(table, area);
 }
 
 fn window_start(selected: usize, len: usize, visible: usize) -> usize {
@@ -230,5 +291,7 @@ fn window_start(selected: usize, len: usize, visible: usize) -> usize {
     }
 
     let max_start = len.saturating_sub(visible);
-    selected.saturating_sub(visible.saturating_sub(1)).min(max_start)
+    selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(max_start)
 }

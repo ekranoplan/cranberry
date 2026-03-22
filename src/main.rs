@@ -1,12 +1,13 @@
 mod app;
 mod config;
+mod logging;
 mod prometheus;
 mod ui;
 
 use std::env;
 use std::io;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 use app::App;
 use config::Config;
@@ -16,9 +17,22 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tracing::info;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(env::args().skip(1).collect())?;
+    if let Err(err) = logging::init(&config.logging) {
+        eprintln!("logging initialization failed: {err}");
+    } else {
+        info!(
+            log_path = %config.logging.path,
+            log_level = %config.logging.level,
+            refresh_secs = config.display.refresh_secs.unwrap_or(15),
+            prometheus_base_url = config.prometheus.base_url.as_deref().unwrap_or("sample"),
+            "logging initialized"
+        );
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -43,11 +57,19 @@ fn run_app(
         .refresh_secs
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(15));
+    info!(
+        refresh_secs = refresh_interval.as_secs(),
+        "starting application"
+    );
     let mut app = App::new(config.prometheus, config.display);
     let mut last_reload = Instant::now();
 
     loop {
         if last_reload.elapsed() >= refresh_interval {
+            info!(
+                refresh_secs = refresh_interval.as_secs(),
+                "automatic reload triggered"
+            );
             app.reload();
             last_reload = Instant::now();
         }
@@ -88,11 +110,13 @@ fn run_app(
                         KeyCode::Char('q') => break,
                         KeyCode::Down | KeyCode::Char('j') => app.next(),
                         KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                        KeyCode::Char('h') => app.toggle_history_view(),
                         KeyCode::Char('[') => app.previous_target(),
                         KeyCode::Char(']') => app.next_target(),
                         KeyCode::Char('t') => app.open_target_picker(),
                         KeyCode::Char('/') => app.open_filter_input(),
                         KeyCode::Char('r') => {
+                            info!("manual reload triggered");
                             app.reload();
                             last_reload = Instant::now();
                         }
@@ -130,6 +154,12 @@ fn load_config(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> 
 
     if base_url_override.is_some() {
         config.prometheus.base_url = base_url_override;
+    }
+
+    if let Some(base_url) = &config.prometheus.base_url {
+        info!(%base_url, "prometheus base url configured");
+    } else {
+        info!("using built-in sample metrics");
     }
 
     Ok(config)

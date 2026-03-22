@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use tracing::{error, info, warn};
 
 const HISTORY_LIMIT: usize = 60;
 
@@ -18,10 +19,17 @@ pub struct App {
     pub target_selected: usize,
     pub target_picker_open: bool,
     pub target_cursor: usize,
+    pub history_view: HistoryView,
     source: DataSource,
     display: DisplayConfig,
     all_metrics: Vec<MetricSample>,
     metric_history: BTreeMap<MetricKey, VecDeque<f64>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryView {
+    Graph,
+    Table,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +47,7 @@ enum DataSource {
 impl App {
     pub fn new(prometheus: PrometheusConfig, display: DisplayConfig) -> Self {
         let source = build_source(prometheus);
+        let refresh_secs = display.refresh_secs.unwrap_or(15);
 
         let mut app = Self {
             metrics: Vec::new(),
@@ -51,11 +60,13 @@ impl App {
             target_selected: 0,
             target_picker_open: false,
             target_cursor: 0,
+            history_view: HistoryView::Graph,
             source,
             display,
             all_metrics: Vec::new(),
             metric_history: BTreeMap::new(),
         };
+        info!(refresh_secs, "app initialized");
         app.reload();
         app
     }
@@ -95,6 +106,7 @@ impl App {
         }
         self.target_selected = (self.target_selected + 1) % self.target_options.len();
         self.target_cursor = self.target_selected;
+        info!(target = %self.selected_target().display(), "selected next target");
         self.apply_target_selection();
     }
 
@@ -108,6 +120,7 @@ impl App {
             self.target_selected - 1
         };
         self.target_cursor = self.target_selected;
+        info!(target = %self.selected_target().display(), "selected previous target");
         self.apply_target_selection();
     }
 
@@ -115,9 +128,26 @@ impl App {
         &self.target_options[self.target_selected]
     }
 
+    pub fn refresh_secs(&self) -> u64 {
+        self.display.refresh_secs.unwrap_or(15)
+    }
+
+    pub fn toggle_history_view(&mut self) {
+        self.history_view = match self.history_view {
+            HistoryView::Graph => HistoryView::Table,
+            HistoryView::Table => HistoryView::Graph,
+        };
+        self.status = format!("history view: {}", self.history_view.label());
+        info!(
+            history_view = self.history_view.label(),
+            "toggled history view"
+        );
+    }
+
     pub fn open_filter_input(&mut self) {
         self.filter_input_open = true;
         self.status = format!("filter metrics: {}", self.filter_query);
+        info!(filter = %self.filter_query, "opened filter input");
     }
 
     pub fn close_filter_input(&mut self) {
@@ -127,6 +157,7 @@ impl App {
             self.metrics.len(),
             self.selected_target().display()
         );
+        info!(filter = %self.filter_query, metrics = self.metrics.len(), "closed filter input");
     }
 
     pub fn push_filter_char(&mut self, ch: char) {
@@ -134,6 +165,7 @@ impl App {
         self.filter_query.push(ch);
         self.rebuild_metrics_view(previous_selection.as_ref());
         self.status = format!("filter metrics: {}", self.filter_query);
+        info!(filter = %self.filter_query, added = %ch, "updated filter query");
     }
 
     pub fn pop_filter_char(&mut self) {
@@ -141,6 +173,7 @@ impl App {
         self.filter_query.pop();
         self.rebuild_metrics_view(previous_selection.as_ref());
         self.status = format!("filter metrics: {}", self.filter_query);
+        info!(filter = %self.filter_query, "deleted filter character");
     }
 
     pub fn clear_filter(&mut self) {
@@ -148,12 +181,14 @@ impl App {
         self.filter_query.clear();
         self.rebuild_metrics_view(previous_selection.as_ref());
         self.status = String::from("filter cleared");
+        info!("cleared filter query");
     }
 
     pub fn open_target_picker(&mut self) {
         self.target_picker_open = true;
         self.target_cursor = self.target_selected;
         self.status = String::from("select target and press Enter");
+        info!(current_target = %self.selected_target().display(), "opened target picker");
     }
 
     pub fn close_target_picker(&mut self) {
@@ -163,6 +198,7 @@ impl App {
             self.metrics.len(),
             self.selected_target().display()
         );
+        info!(target = %self.selected_target().display(), "closed target picker");
     }
 
     pub fn picker_next(&mut self) {
@@ -189,10 +225,12 @@ impl App {
         }
         self.target_selected = self.target_cursor;
         self.target_picker_open = false;
+        info!(target = %self.selected_target().display(), "applied target picker selection");
         self.apply_target_selection();
     }
 
     pub fn reload(&mut self) {
+        info!(source = %self.data_source_label(), "starting reload");
         match &self.source {
             DataSource::Sample => {
                 self.source_label = String::from("sample");
@@ -202,6 +240,7 @@ impl App {
                 let base_url = base_url.clone();
                 self.source_label = base_url.clone();
                 if let Err(err) = self.reload_prometheus(&base_url) {
+                    error!(%base_url, error = %err, "reload from prometheus failed");
                     self.reset_failed_state(format!("fetch error: {err}"));
                 }
             }
@@ -209,15 +248,24 @@ impl App {
     }
 
     pub fn reload_from_str(&mut self, input: &str) {
+        info!(bytes = input.len(), "reloading metrics from text input");
         match parse_metrics(input) {
-            Ok(metrics) => self.set_metrics(metrics),
-            Err(err) => self.reset_failed_state(format!("parse error: {err}")),
+            Ok(metrics) => {
+                info!(metrics = metrics.len(), "parsed metrics successfully");
+                self.set_metrics(metrics)
+            }
+            Err(err) => {
+                error!(error = %err, "failed to parse metrics");
+                self.reset_failed_state(format!("parse error: {err}"))
+            }
         }
     }
 
     fn reload_prometheus(&mut self, base_url: &str) -> Result<(), String> {
         let previous = self.target_options.get(self.target_selected).cloned();
+        info!(%base_url, "fetching targets from prometheus");
         let targets = fetch_targets(base_url)?;
+        info!(%base_url, targets = targets.len(), "fetched targets from prometheus");
         self.target_options = targets;
         self.target_selected = previous
             .and_then(|current| self.target_options.iter().position(|item| item == &current))
@@ -233,9 +281,16 @@ impl App {
         self.record_metric_history();
         self.refresh_target_options();
         self.rebuild_metrics_view(previous_selection.as_ref());
+        info!(
+            loaded_metrics = self.all_metrics.len(),
+            visible_metrics = self.metrics.len(),
+            target = %self.selected_target().display(),
+            "updated metrics state"
+        );
     }
 
     fn reset_failed_state(&mut self, status: String) {
+        warn!(status = %status, "resetting application state after failure");
         self.all_metrics.clear();
         self.metrics.clear();
         self.metric_history.clear();
@@ -248,6 +303,7 @@ impl App {
     }
 
     fn apply_target_selection(&mut self) {
+        info!(target = %self.selected_target().display(), "applying target selection");
         match &self.source {
             DataSource::Sample => {
                 let previous_selection = self.selected_metric_key();
@@ -256,6 +312,7 @@ impl App {
             DataSource::PrometheusApi { base_url } => {
                 let base_url = base_url.clone();
                 if let Err(err) = self.load_selected_target_metrics(&base_url) {
+                    error!(%base_url, error = %err, "loading selected target metrics failed");
                     self.reset_failed_state(format!("fetch error: {err}"));
                 }
             }
@@ -264,10 +321,17 @@ impl App {
 
     fn load_selected_target_metrics(&mut self, base_url: &str) -> Result<(), String> {
         let previous_selection = self.selected_metric_key();
+        info!(%base_url, target = %self.selected_target().display(), "fetching target metrics");
         let metrics = fetch_target_metrics(base_url, self.selected_target())?;
         self.all_metrics = metrics;
         self.record_metric_history();
         self.rebuild_metrics_view(previous_selection.as_ref());
+        info!(
+            %base_url,
+            target = %self.selected_target().display(),
+            metrics = self.all_metrics.len(),
+            "loaded target metrics"
+        );
         Ok(())
     }
 
@@ -307,6 +371,12 @@ impl App {
             self.metrics.len(),
             self.selected_target().display()
         );
+        info!(
+            visible_metrics = self.metrics.len(),
+            target = %self.selected_target().display(),
+            filter = %self.filter_query,
+            "rebuilt metrics view"
+        );
     }
 
     fn record_metric_history(&mut self) {
@@ -316,10 +386,7 @@ impl App {
             .retain(|metric_key, _| current_keys.contains(metric_key));
 
         for metric in &self.all_metrics {
-            let history = self
-                .metric_history
-                .entry(metric_key(metric))
-                .or_default();
+            let history = self.metric_history.entry(metric_key(metric)).or_default();
             history.push_back(metric.value);
             if history.len() > HISTORY_LIMIT {
                 history.pop_front();
@@ -363,7 +430,8 @@ impl App {
         }
 
         let metric_job = label_value(metric, "job");
-        let metric_target = label_value(metric, "instance").or_else(|| label_value(metric, "target"));
+        let metric_target =
+            label_value(metric, "instance").or_else(|| label_value(metric, "target"));
         metric_job.as_deref() == Some(selected.job.as_str())
             && metric_target.as_deref() == Some(selected.target.as_str())
     }
@@ -403,6 +471,15 @@ impl TargetFilter {
     }
 }
 
+impl HistoryView {
+    pub fn label(self) -> &'static str {
+        match self {
+            HistoryView::Graph => "graph",
+            HistoryView::Table => "table",
+        }
+    }
+}
+
 const SAMPLE_PROMETHEUS: &str = r#"
 # HELP up Was the last scrape of the target successful.
 # TYPE up gauge
@@ -420,6 +497,15 @@ fn build_source(prometheus: PrometheusConfig) -> DataSource {
     }
 }
 
+impl App {
+    fn data_source_label(&self) -> &str {
+        match &self.source {
+            DataSource::Sample => "sample",
+            DataSource::PrometheusApi { base_url } => base_url.as_str(),
+        }
+    }
+}
+
 fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -427,11 +513,21 @@ fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
         .query(&[("match[]", "up")])
         .timeout(std::time::Duration::from_secs(5))
         .send()
-        .map_err(|err| err.to_string())?;
-    let response = response.error_for_status().map_err(|err| err.to_string())?;
-    let payload: SeriesResponse = response.json().map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            error!(%base_url, error = %err, "prometheus target request failed");
+            err.to_string()
+        })?;
+    let response = response.error_for_status().map_err(|err| {
+        error!(%base_url, error = %err, "prometheus target response returned error status");
+        err.to_string()
+    })?;
+    let payload: SeriesResponse = response.json().map_err(|err| {
+        error!(%base_url, error = %err, "failed to decode prometheus target response");
+        err.to_string()
+    })?;
 
     if payload.status != "success" {
+        error!(%base_url, status = %payload.status, "prometheus target query returned non-success status");
         return Err(format!("series status {}", payload.status));
     }
 
@@ -443,7 +539,10 @@ fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
     Ok(build_target_options(filters))
 }
 
-fn fetch_target_metrics(base_url: &str, target: &TargetFilter) -> Result<Vec<MetricSample>, String> {
+fn fetch_target_metrics(
+    base_url: &str,
+    target: &TargetFilter,
+) -> Result<Vec<MetricSample>, String> {
     let client = reqwest::blocking::Client::new();
     let expr = if target.job == "*" {
         String::from("{job!=\"\"}")
@@ -460,18 +559,57 @@ fn fetch_target_metrics(base_url: &str, target: &TargetFilter) -> Result<Vec<Met
         .query(&[("query", expr.as_str())])
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .map_err(|err| err.to_string())?;
-    let response = response.error_for_status().map_err(|err| err.to_string())?;
-    let payload: QueryResponse = response.json().map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            error!(
+                %base_url,
+                target = %target.display(),
+                query = %expr,
+                error = %err,
+                "prometheus metric request failed"
+            );
+            err.to_string()
+        })?;
+    let response = response.error_for_status().map_err(|err| {
+        error!(
+            %base_url,
+            target = %target.display(),
+            query = %expr,
+            error = %err,
+            "prometheus metric response returned error status"
+        );
+        err.to_string()
+    })?;
+    let payload: QueryResponse = response.json().map_err(|err| {
+        error!(
+            %base_url,
+            target = %target.display(),
+            error = %err,
+            "failed to decode prometheus metric response"
+        );
+        err.to_string()
+    })?;
 
     if payload.status != "success" {
+        error!(
+            %base_url,
+            target = %target.display(),
+            status = %payload.status,
+            "prometheus metric query returned non-success status"
+        );
         return Err(format!("query status {}", payload.status));
     }
 
-    let data = payload
-        .data
-        .ok_or_else(|| String::from("missing response data"))?;
+    let data = payload.data.ok_or_else(|| {
+        error!(%base_url, target = %target.display(), "prometheus metric response missing data");
+        String::from("missing response data")
+    })?;
     if data.result_type != "vector" {
+        error!(
+            %base_url,
+            target = %target.display(),
+            result_type = %data.result_type,
+            "unsupported prometheus result type"
+        );
         return Err(format!("unsupported result type {}", data.result_type));
     }
 
@@ -520,7 +658,11 @@ impl QuerySample {
             .filter(|(key, _)| key != "__name__")
             .collect();
 
-        Ok(MetricSample { name, labels, value })
+        Ok(MetricSample {
+            name,
+            labels,
+            value,
+        })
     }
 }
 
@@ -564,7 +706,7 @@ fn metric_key(metric: &MetricSample) -> MetricKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, TargetFilter};
+    use super::{App, HistoryView, TargetFilter};
     use crate::config::{DisplayConfig, PrometheusConfig};
 
     #[test]
@@ -739,7 +881,25 @@ mod tests {
             "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 69\n",
         );
 
-        assert_eq!(app.selected_metric().map(|metric| metric.name.as_str()), Some("gpu_temperature_celsius"));
+        assert_eq!(
+            app.selected_metric().map(|metric| metric.name.as_str()),
+            Some("gpu_temperature_celsius")
+        );
         assert_eq!(app.selected_metric_history(), vec![70.0, 71.0, 69.0]);
+    }
+
+    #[test]
+    fn toggles_history_view_mode() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+
+        assert_eq!(app.history_view, HistoryView::Graph);
+
+        app.toggle_history_view();
+        assert_eq!(app.history_view, HistoryView::Table);
+        assert_eq!(app.status, "history view: table");
+
+        app.toggle_history_view();
+        assert_eq!(app.history_view, HistoryView::Graph);
+        assert_eq!(app.status, "history view: graph");
     }
 }
