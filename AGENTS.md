@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This project develops a TUI dashboard for displaying Prometheus-format metrics.
+This project develops a TUI dashboard for displaying metrics collected by Prometheus through the Prometheus HTTP API.
 
 ## Stack
 
@@ -19,6 +19,8 @@ This project develops a TUI dashboard for displaying Prometheus-format metrics.
 
 ## Configuration
 
-- `cranberry.toml` can define the Prometheus HTTP endpoint.
+- `cranberry.toml` can define the Prometheus base URL.
 - `cranberry.toml` can define initial display settings.
 - `cranberry.toml` can define the automatic refresh interval in seconds.
+- Targets are discovered dynamically from Prometheus.
+- Metrics for the selected target are loaded dynamically from Prometheus.
