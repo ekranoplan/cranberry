@@ -1,7 +1,6 @@
 [prometheus]
-url = "http://127.0.0.1:9090/metrics"
+base_url = "http://127.0.0.1:9090"
 
 [display]
-max_metrics = 20
 initial_metric = "up"
 refresh_secs = 15

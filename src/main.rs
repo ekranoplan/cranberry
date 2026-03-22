@@ -43,7 +43,7 @@ fn run_app(
         .refresh_secs
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(15));
-    let mut app = App::new(config.prometheus.url, config.display);
+    let mut app = App::new(config.prometheus, config.display);
     let mut last_reload = Instant::now();
 
     loop {
@@ -60,15 +60,44 @@ fn run_app(
                     continue;
                 }
 
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    KeyCode::Char('r') => {
-                        app.reload();
-                        last_reload = Instant::now();
+                if app.target_picker_open {
+                    match key.code {
+                        KeyCode::Esc => app.close_target_picker(),
+                        KeyCode::Enter => app.picker_apply(),
+                        KeyCode::Down | KeyCode::Char('j') => app.picker_next(),
+                        KeyCode::Up | KeyCode::Char('k') => app.picker_previous(),
+                        KeyCode::Char('q') => break,
+                        _ => {}
                     }
-                    _ => {}
+                } else if app.filter_input_open {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => app.close_filter_input(),
+                        KeyCode::Backspace => app.pop_filter_char(),
+                        KeyCode::Char('u')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            app.clear_filter()
+                        }
+                        KeyCode::Char(ch) => app.push_filter_char(ch),
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Down | KeyCode::Char('j') => app.next(),
+                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                        KeyCode::Char('[') => app.previous_target(),
+                        KeyCode::Char(']') => app.next_target(),
+                        KeyCode::Char('t') => app.open_target_picker(),
+                        KeyCode::Char('/') => app.open_filter_input(),
+                        KeyCode::Char('r') => {
+                            app.reload();
+                            last_reload = Instant::now();
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -79,7 +108,7 @@ fn run_app(
 
 fn load_config(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
     let mut config_path = String::from("cranberry.toml");
-    let mut source_url_override = None;
+    let mut base_url_override = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -89,7 +118,7 @@ fn load_config(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> 
                 .ok_or_else(|| String::from("missing path after --config"))?;
             config_path = path;
         } else {
-            source_url_override = Some(arg);
+            base_url_override = Some(arg);
         }
     }
 
@@ -99,8 +128,8 @@ fn load_config(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> 
         Config::default()
     };
 
-    if source_url_override.is_some() {
-        config.prometheus.url = source_url_override;
+    if base_url_override.is_some() {
+        config.prometheus.base_url = base_url_override;
     }
 
     Ok(config)

@@ -12,7 +12,7 @@ pub struct Config {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct PrometheusConfig {
-    pub url: Option<String>,
+    pub base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
