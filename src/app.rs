@@ -1,37 +1,63 @@
 use crate::{
-    config::DisplayConfig,
+    config::{DisplayConfig, PrometheusConfig},
     prometheus::{parse_metrics, MetricSample},
 };
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+const HISTORY_LIMIT: usize = 60;
 
 pub struct App {
     pub metrics: Vec<MetricSample>,
     pub selected: usize,
     pub status: String,
     pub source_label: String,
+    pub filter_query: String,
+    pub filter_input_open: bool,
+    pub target_options: Vec<TargetFilter>,
+    pub target_selected: usize,
+    pub target_picker_open: bool,
+    pub target_cursor: usize,
     source: DataSource,
     display: DisplayConfig,
+    all_metrics: Vec<MetricSample>,
+    metric_history: BTreeMap<MetricKey, VecDeque<f64>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetFilter {
+    pub job: String,
+    pub target: String,
 }
 
 #[derive(Clone, Debug)]
 enum DataSource {
     Sample,
-    Http { url: String },
+    PrometheusApi { base_url: String },
 }
 
 impl App {
-    pub fn new(source_url: Option<String>, display: DisplayConfig) -> Self {
-        let source = match source_url {
-            Some(url) => DataSource::Http { url },
-            None => DataSource::Sample,
-        };
+    pub fn new(prometheus: PrometheusConfig, display: DisplayConfig) -> Self {
+        let source = build_source(prometheus);
 
         let mut app = Self {
             metrics: Vec::new(),
             selected: 0,
             status: String::from("initializing"),
             source_label: String::new(),
+            filter_query: String::new(),
+            filter_input_open: false,
+            target_options: vec![TargetFilter {
+                job: String::from("*"),
+                target: String::from("*"),
+            }],
+            target_selected: 0,
+            target_picker_open: false,
+            target_cursor: 0,
             source,
             display,
+            all_metrics: Vec::new(),
+            metric_history: BTreeMap::new(),
         };
         app.reload();
         app
@@ -59,21 +85,127 @@ impl App {
         self.metrics.get(self.selected)
     }
 
+    pub fn selected_metric_history(&self) -> Vec<f64> {
+        self.selected_metric()
+            .and_then(|metric| self.metric_history.get(&metric_key(metric)))
+            .map(|values| values.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn next_target(&mut self) {
+        if self.target_options.is_empty() {
+            return;
+        }
+        self.target_selected = (self.target_selected + 1) % self.target_options.len();
+        self.target_cursor = self.target_selected;
+        self.apply_target_selection();
+    }
+
+    pub fn previous_target(&mut self) {
+        if self.target_options.is_empty() {
+            return;
+        }
+        self.target_selected = if self.target_selected == 0 {
+            self.target_options.len() - 1
+        } else {
+            self.target_selected - 1
+        };
+        self.target_cursor = self.target_selected;
+        self.apply_target_selection();
+    }
+
+    pub fn selected_target(&self) -> &TargetFilter {
+        &self.target_options[self.target_selected]
+    }
+
+    pub fn open_filter_input(&mut self) {
+        self.filter_input_open = true;
+        self.status = format!("filter metrics: {}", self.filter_query);
+    }
+
+    pub fn close_filter_input(&mut self) {
+        self.filter_input_open = false;
+        self.status = format!(
+            "loaded {} metrics for {}",
+            self.metrics.len(),
+            self.selected_target().display()
+        );
+    }
+
+    pub fn push_filter_char(&mut self, ch: char) {
+        let previous_selection = self.selected_metric_key();
+        self.filter_query.push(ch);
+        self.rebuild_metrics_view(previous_selection.as_ref());
+        self.status = format!("filter metrics: {}", self.filter_query);
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        let previous_selection = self.selected_metric_key();
+        self.filter_query.pop();
+        self.rebuild_metrics_view(previous_selection.as_ref());
+        self.status = format!("filter metrics: {}", self.filter_query);
+    }
+
+    pub fn clear_filter(&mut self) {
+        let previous_selection = self.selected_metric_key();
+        self.filter_query.clear();
+        self.rebuild_metrics_view(previous_selection.as_ref());
+        self.status = String::from("filter cleared");
+    }
+
+    pub fn open_target_picker(&mut self) {
+        self.target_picker_open = true;
+        self.target_cursor = self.target_selected;
+        self.status = String::from("select target and press Enter");
+    }
+
+    pub fn close_target_picker(&mut self) {
+        self.target_picker_open = false;
+        self.status = format!(
+            "loaded {} metrics for {}",
+            self.metrics.len(),
+            self.selected_target().display()
+        );
+    }
+
+    pub fn picker_next(&mut self) {
+        if self.target_options.is_empty() {
+            return;
+        }
+        self.target_cursor = (self.target_cursor + 1) % self.target_options.len();
+    }
+
+    pub fn picker_previous(&mut self) {
+        if self.target_options.is_empty() {
+            return;
+        }
+        self.target_cursor = if self.target_cursor == 0 {
+            self.target_options.len() - 1
+        } else {
+            self.target_cursor - 1
+        };
+    }
+
+    pub fn picker_apply(&mut self) {
+        if self.target_options.is_empty() {
+            return;
+        }
+        self.target_selected = self.target_cursor;
+        self.target_picker_open = false;
+        self.apply_target_selection();
+    }
+
     pub fn reload(&mut self) {
         match &self.source {
             DataSource::Sample => {
                 self.source_label = String::from("sample");
                 self.reload_from_str(SAMPLE_PROMETHEUS);
             }
-            DataSource::Http { url } => {
-                self.source_label = url.clone();
-                match fetch_metrics(url) {
-                    Ok(body) => self.reload_from_str(&body),
-                    Err(err) => {
-                        self.metrics.clear();
-                        self.selected = 0;
-                        self.status = format!("fetch error: {err}");
-                    }
+            DataSource::PrometheusApi { base_url } => {
+                let base_url = base_url.clone();
+                self.source_label = base_url.clone();
+                if let Err(err) = self.reload_prometheus(&base_url) {
+                    self.reset_failed_state(format!("fetch error: {err}"));
                 }
             }
         }
@@ -81,25 +213,157 @@ impl App {
 
     pub fn reload_from_str(&mut self, input: &str) {
         match parse_metrics(input) {
-            Ok(metrics) => {
-                self.metrics = metrics;
-                self.apply_display_config();
-                self.status = format!("loaded {} metrics", self.metrics.len());
+            Ok(metrics) => self.set_metrics(metrics),
+            Err(err) => self.reset_failed_state(format!("parse error: {err}")),
+        }
+    }
+
+    fn reload_prometheus(&mut self, base_url: &str) -> Result<(), String> {
+        let previous = self.target_options.get(self.target_selected).cloned();
+        let targets = fetch_targets(base_url)?;
+        self.target_options = targets;
+        self.target_selected = previous
+            .and_then(|current| self.target_options.iter().position(|item| item == &current))
+            .unwrap_or(0);
+        self.target_cursor = self.target_selected;
+        self.target_picker_open = false;
+        self.load_selected_target_metrics(base_url)
+    }
+
+    fn set_metrics(&mut self, metrics: Vec<MetricSample>) {
+        let previous_selection = self.selected_metric_key();
+        self.all_metrics = metrics;
+        self.record_metric_history();
+        self.refresh_target_options();
+        self.rebuild_metrics_view(previous_selection.as_ref());
+    }
+
+    fn reset_failed_state(&mut self, status: String) {
+        self.all_metrics.clear();
+        self.metrics.clear();
+        self.metric_history.clear();
+        self.target_options = vec![TargetFilter {
+            job: String::from("*"),
+            target: String::from("*"),
+        }];
+        self.target_selected = 0;
+        self.target_cursor = 0;
+        self.target_picker_open = false;
+        self.selected = 0;
+        self.status = status;
+    }
+
+    fn apply_target_selection(&mut self) {
+        match &self.source {
+            DataSource::Sample => {
+                let previous_selection = self.selected_metric_key();
+                self.rebuild_metrics_view(previous_selection.as_ref());
             }
-            Err(err) => {
-                self.metrics.clear();
-                self.selected = 0;
-                self.status = format!("parse error: {err}");
+            DataSource::PrometheusApi { base_url } => {
+                let base_url = base_url.clone();
+                if let Err(err) = self.load_selected_target_metrics(&base_url) {
+                    self.reset_failed_state(format!("fetch error: {err}"));
+                }
             }
         }
     }
 
-    fn apply_display_config(&mut self) {
+    fn load_selected_target_metrics(&mut self, base_url: &str) -> Result<(), String> {
+        let previous_selection = self.selected_metric_key();
+        let metrics = fetch_target_metrics(base_url, self.selected_target())?;
+        self.all_metrics = metrics;
+        self.record_metric_history();
+        self.rebuild_metrics_view(previous_selection.as_ref());
+        Ok(())
+    }
+
+    fn refresh_target_options(&mut self) {
+        let previous = self.target_options.get(self.target_selected).cloned();
+        let mut seen = BTreeSet::new();
+        let mut options = vec![TargetFilter {
+            job: String::from("*"),
+            target: String::from("*"),
+        }];
+
+        for metric in &self.all_metrics {
+            let job = label_value(metric, "job");
+            let target = label_value(metric, "instance")
+                .or_else(|| label_value(metric, "target"))
+                .unwrap_or_else(|| String::from("-"));
+            if let Some(job) = job {
+                let filter = TargetFilter { job, target };
+                if seen.insert((filter.job.clone(), filter.target.clone())) {
+                    options.push(filter);
+                }
+            }
+        }
+
+        options[1..].sort_by(|left, right| {
+            left.job
+                .cmp(&right.job)
+                .then_with(|| left.target.cmp(&right.target))
+        });
+
+        self.target_options = options;
+        self.target_selected = previous
+            .and_then(|current| self.target_options.iter().position(|item| item == &current))
+            .unwrap_or(0);
+        self.target_cursor = self.target_selected;
+    }
+
+    fn rebuild_metrics_view(&mut self, previous_selection: Option<&MetricKey>) {
+        self.metrics = self
+            .all_metrics
+            .iter()
+            .filter(|metric| self.matches_selected_target(metric))
+            .filter(|metric| self.matches_filter(metric))
+            .cloned()
+            .collect();
         if let Some(max_metrics) = self.display.max_metrics {
             self.metrics.truncate(max_metrics);
         }
 
+        self.restore_selection(previous_selection);
+
+        self.status = format!(
+            "loaded {} metrics for {}",
+            self.metrics.len(),
+            self.selected_target().display()
+        );
+    }
+
+    fn record_metric_history(&mut self) {
+        let current_keys: BTreeSet<MetricKey> = self.all_metrics.iter().map(metric_key).collect();
+
+        self.metric_history
+            .retain(|metric_key, _| current_keys.contains(metric_key));
+
+        for metric in &self.all_metrics {
+            let history = self
+                .metric_history
+                .entry(metric_key(metric))
+                .or_default();
+            history.push_back(metric.value);
+            if history.len() > HISTORY_LIMIT {
+                history.pop_front();
+            }
+        }
+    }
+
+    fn restore_selection(&mut self, previous_selection: Option<&MetricKey>) {
         self.selected = 0;
+
+        if let Some(previous_selection) = previous_selection {
+            if let Some(index) = self
+                .metrics
+                .iter()
+                .position(|metric| metric_key(metric) == *previous_selection)
+            {
+                self.selected = index;
+                return;
+            }
+        }
+
         if let Some(initial_metric) = &self.display.initial_metric {
             if let Some(index) = self
                 .metrics
@@ -108,6 +372,50 @@ impl App {
             {
                 self.selected = index;
             }
+        }
+    }
+
+    fn selected_metric_key(&self) -> Option<MetricKey> {
+        self.selected_metric().map(metric_key)
+    }
+
+    fn matches_selected_target(&self, metric: &MetricSample) -> bool {
+        let selected = self.selected_target();
+        if selected.job == "*" {
+            return true;
+        }
+
+        let metric_job = label_value(metric, "job");
+        let metric_target = label_value(metric, "instance").or_else(|| label_value(metric, "target"));
+        metric_job.as_deref() == Some(selected.job.as_str())
+            && metric_target.as_deref() == Some(selected.target.as_str())
+    }
+
+    fn matches_filter(&self, metric: &MetricSample) -> bool {
+        if self.filter_query.is_empty() {
+            return true;
+        }
+
+        let needle = self.filter_query.to_lowercase();
+        if metric.name.to_lowercase().contains(&needle) {
+            return true;
+        }
+
+        metric
+            .labels
+            .iter()
+            .any(|(key, value)| format!("{key}={value}").to_lowercase().contains(&needle))
+    }
+}
+
+type MetricKey = (String, Vec<(String, String)>);
+
+impl TargetFilter {
+    pub fn display(&self) -> String {
+        if self.job == "*" {
+            String::from("all targets")
+        } else {
+            format!("{}/{}", self.job, self.target)
         }
     }
 }
@@ -122,26 +430,166 @@ http_requests_total{method="GET",code="200"} 128
 http_requests_total{method="GET",code="500"} 3
 "#;
 
-fn fetch_metrics(url: &str) -> Result<String, String> {
-    let response = reqwest::blocking::Client::new()
-        .get(url)
+fn build_source(prometheus: PrometheusConfig) -> DataSource {
+    match prometheus.base_url {
+        Some(base_url) => DataSource::PrometheusApi { base_url },
+        None => DataSource::Sample,
+    }
+}
+
+fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(format!("{}/api/v1/series", base_url.trim_end_matches('/')))
+        .query(&[("match[]", "up")])
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .map_err(|err| err.to_string())?;
-
     let response = response.error_for_status().map_err(|err| err.to_string())?;
-    response.text().map_err(|err| err.to_string())
+    let payload: SeriesResponse = response.json().map_err(|err| err.to_string())?;
+
+    if payload.status != "success" {
+        return Err(format!("series status {}", payload.status));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut options = vec![TargetFilter {
+        job: String::from("*"),
+        target: String::from("*"),
+    }];
+
+    for series in payload.data {
+        if let (Some(job), Some(target)) = (series.get("job"), series.get("instance")) {
+            let filter = TargetFilter {
+                job: job.clone(),
+                target: target.clone(),
+            };
+            if seen.insert((filter.job.clone(), filter.target.clone())) {
+                options.push(filter);
+            }
+        }
+    }
+
+    options[1..].sort_by(|left, right| {
+        left.job
+            .cmp(&right.job)
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    Ok(options)
+}
+
+fn fetch_target_metrics(base_url: &str, target: &TargetFilter) -> Result<Vec<MetricSample>, String> {
+    let client = reqwest::blocking::Client::new();
+    let expr = if target.job == "*" {
+        String::from("{job!=\"\"}")
+    } else {
+        format!(
+            "{{job=\"{}\",instance=\"{}\"}}",
+            escape_matcher(&target.job),
+            escape_matcher(&target.target)
+        )
+    };
+
+    let response = client
+        .get(format!("{}/api/v1/query", base_url.trim_end_matches('/')))
+        .query(&[("query", expr.as_str())])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .map_err(|err| err.to_string())?;
+    let response = response.error_for_status().map_err(|err| err.to_string())?;
+    let payload: QueryResponse = response.json().map_err(|err| err.to_string())?;
+
+    if payload.status != "success" {
+        return Err(format!("query status {}", payload.status));
+    }
+
+    let data = payload
+        .data
+        .ok_or_else(|| String::from("missing response data"))?;
+    if data.result_type != "vector" {
+        return Err(format!("unsupported result type {}", data.result_type));
+    }
+
+    data.result
+        .into_iter()
+        .map(QuerySample::into_metric_sample)
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryResponse {
+    status: String,
+    data: Option<QueryData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryData {
+    #[serde(rename = "resultType")]
+    result_type: String,
+    result: Vec<QuerySample>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuerySample {
+    metric: BTreeMap<String, String>,
+    value: (f64, String),
+}
+
+impl QuerySample {
+    fn into_metric_sample(self) -> Result<MetricSample, String> {
+        let value = self
+            .value
+            .1
+            .parse::<f64>()
+            .map_err(|_| String::from("invalid sample value"))?;
+
+        let name = self
+            .metric
+            .get("__name__")
+            .cloned()
+            .unwrap_or_else(|| String::from("unknown"));
+
+        let labels: Vec<(String, String)> = self
+            .metric
+            .into_iter()
+            .filter(|(key, _)| key != "__name__")
+            .collect();
+
+        Ok(MetricSample { name, labels, value })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SeriesResponse {
+    status: String,
+    data: Vec<BTreeMap<String, String>>,
+}
+
+fn escape_matcher(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn label_value(metric: &MetricSample, key: &str) -> Option<String> {
+    metric
+        .labels
+        .iter()
+        .find(|(label_key, _)| label_key == key)
+        .map(|(_, value)| value.clone())
+}
+
+fn metric_key(metric: &MetricSample) -> MetricKey {
+    (metric.name.clone(), metric.labels.clone())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::App;
-    use crate::config::DisplayConfig;
+    use super::{App, TargetFilter};
+    use crate::config::{DisplayConfig, PrometheusConfig};
 
     #[test]
     fn applies_display_config_after_reload() {
         let mut app = App::new(
-            None,
+            PrometheusConfig::default(),
             DisplayConfig {
                 max_metrics: Some(2),
                 initial_metric: Some(String::from("http_requests_total")),
@@ -156,5 +604,161 @@ mod tests {
         assert_eq!(app.metrics.len(), 2);
         assert_eq!(app.selected, 1);
         assert_eq!(app.metrics[app.selected].name, "http_requests_total");
+    }
+
+    #[test]
+    fn filters_metrics_by_selected_target() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\nup{job=\"api\",instance=\"b:9090\"} 1\n",
+        );
+
+        assert_eq!(app.target_options.len(), 3);
+        app.next_target();
+        assert_eq!(
+            app.selected_target(),
+            &TargetFilter {
+                job: String::from("api"),
+                target: String::from("a:9090"),
+            }
+        );
+        assert_eq!(app.metrics.len(), 2);
+
+        app.next_target();
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(app.selected_target().target, "b:9090");
+    }
+
+    #[test]
+    fn applies_target_picker_selection() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\nup{job=\"api\",instance=\"b:9090\"} 1\n",
+        );
+        app.open_target_picker();
+        app.picker_next();
+        app.picker_next();
+        app.picker_apply();
+
+        assert!(!app.target_picker_open);
+        assert_eq!(app.selected_target().target, "b:9090");
+        assert_eq!(app.metrics.len(), 1);
+    }
+
+    #[test]
+    fn filters_metrics_by_text_query() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
+        );
+        app.push_filter_char('g');
+        app.push_filter_char('p');
+        app.push_filter_char('u');
+
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(app.metrics[0].name, "gpu_temperature_celsius");
+
+        app.clear_filter();
+        assert_eq!(app.metrics.len(), 3);
+    }
+
+    #[test]
+    fn keeps_selected_metric_on_reload() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: Some(String::from("up")),
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
+        );
+        app.next();
+        assert_eq!(app.metrics[app.selected].name, "gpu_temperature_celsius");
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 71\nrequests_total{job=\"api\",instance=\"a:9090\"} 3\n",
+        );
+
+        assert_eq!(app.metrics[app.selected].name, "gpu_temperature_celsius");
+    }
+
+    #[test]
+    fn keeps_text_filter_applied_after_reload() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
+        );
+        app.push_filter_char('g');
+        app.push_filter_char('p');
+        app.push_filter_char('u');
+        assert_eq!(app.metrics.len(), 1);
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 71\nrequests_total{job=\"api\",instance=\"a:9090\"} 3\n",
+        );
+
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(app.metrics[0].name, "gpu_temperature_celsius");
+    }
+
+    #[test]
+    fn accumulates_selected_metric_history_across_reloads() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: Some(String::from("gpu_temperature_celsius")),
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\n",
+        );
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 71\n",
+        );
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 69\n",
+        );
+
+        assert_eq!(app.selected_metric().map(|metric| metric.name.as_str()), Some("gpu_temperature_celsius"));
+        assert_eq!(app.selected_metric_history(), vec![70.0, 71.0, 69.0]);
     }
 }
