@@ -12,6 +12,8 @@ This project develops a TUI dashboard for displaying metrics collected by Promet
 ## Testing
 
 - Tests are run with `cargo test`.
+- After code changes, run `cargo fmt`.
+- After code changes, run `cargo clippy --all-targets --all-features`.
 - The current test coverage is minimal.
 - A parser unit test exists for Prometheus exposition-format input.
 - A display-config unit test exists for initial selection and metric count limiting.

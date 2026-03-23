@@ -26,34 +26,6 @@ Or choose a different config file:
 cargo run -- --config /path/to/cranberry.toml
 ```
 
-## Docker
-
-Build the image:
-
-```bash
-docker build -t cranberry .
-```
-
-Create a config file from the sample:
-
-```bash
-cp cranberry.toml.sample cranberry.toml
-```
-
-Run it with an interactive terminal and mount your config file:
-
-```bash
-docker run -it --rm \
-  -v "$(pwd)/cranberry.toml:/app/cranberry.toml:ro" \
-  cranberry
-```
-
-If you also want to keep the log file on the host, mount a writable directory at `/app` or
-override `logging.path` to point at another mounted path.
-
-If Prometheus is running on the host machine, `host.docker.internal` may be easier than
-`127.0.0.1` in `cranberry.toml`, depending on your Docker environment.
-
 ## Configuration
 
 Example `cranberry.toml.sample`:

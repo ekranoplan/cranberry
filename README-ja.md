@@ -22,34 +22,6 @@ cargo run -- http://127.0.0.1:9090
 cargo run -- --config /path/to/cranberry.toml
 ```
 
-## Docker
-
-イメージをビルドします。
-
-```bash
-docker build -t cranberry .
-```
-
-サンプルから設定ファイルを作成します。
-
-```bash
-cp cranberry.toml.sample cranberry.toml
-```
-
-対話端末付きで起動し、設定ファイルをマウントします。
-
-```bash
-docker run -it --rm \
-  -v "$(pwd)/cranberry.toml:/app/cranberry.toml:ro" \
-  cranberry
-```
-
-ログファイルもホスト側に残したい場合は、`/app` に書き込み可能なディレクトリをマウントするか、
-`logging.path` を別のマウント先パスに変更してください。
-
-Prometheus がホストマシン上で動いている場合は、Docker の実行環境によっては
-`cranberry.toml` 内で `127.0.0.1` より `host.docker.internal` のほうが扱いやすいことがあります。
-
 ## 設定
 
 `cranberry.toml.sample` の例:
