@@ -39,7 +39,7 @@ impl Write for LockedFileWriter {
         let mut file = self
             .file
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log file lock poisoned"))?;
+            .map_err(|_| io::Error::other("log file lock poisoned"))?;
         file.write(buf)
     }
 
@@ -47,7 +47,7 @@ impl Write for LockedFileWriter {
         let mut file = self
             .file
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log file lock poisoned"))?;
+            .map_err(|_| io::Error::other("log file lock poisoned"))?;
         file.flush()
     }
 }
@@ -97,14 +97,9 @@ pub fn open_log_file(path: &Path) -> Result<File, String> {
 }
 
 fn parse_level(level: &str) -> Result<LevelFilter, String> {
-    match level.to_ascii_lowercase().as_str() {
-        "trace" => Ok(LevelFilter::TRACE),
-        "debug" => Ok(LevelFilter::DEBUG),
-        "info" => Ok(LevelFilter::INFO),
-        "warn" => Ok(LevelFilter::WARN),
-        "error" => Ok(LevelFilter::ERROR),
-        _ => Err(format!("unsupported log level: {level}")),
-    }
+    level
+        .parse::<LevelFilter>()
+        .map_err(|_| format!("unsupported log level: {level}"))
 }
 
 fn current_timestamp_jst() -> String {
