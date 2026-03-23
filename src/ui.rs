@@ -9,7 +9,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, HistoryView};
+use crate::{
+    app::{App, HistoryView},
+    prometheus::MetricSample,
+};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let vertical = Layout::default()
@@ -31,10 +34,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Span::raw("  source: "),
         Span::styled(app.source_label.as_str(), Style::default().fg(Color::Green)),
         Span::raw("  target: "),
-        Span::styled(
-            app.selected_target().display(),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(app.selected_target().to_string(), Style::default().fg(Color::Yellow)),
         Span::raw("  refresh: "),
         Span::styled(
             format!("{}s", app.refresh_secs()),
@@ -61,18 +61,13 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let metric_height = body[0].height.saturating_sub(2) as usize;
     let metric_start = window_start(app.selected, app.metrics.len(), metric_height);
-    let items: Vec<ListItem> = app
-        .metrics
-        .iter()
-        .skip(metric_start)
-        .take(metric_height)
-        .enumerate()
-        .map(|(offset, metric)| {
-            let index = metric_start + offset;
-            let prefix = if index == app.selected { "> " } else { "  " };
-            ListItem::new(format!("{prefix}{} = {:.3}", metric.name, metric.value))
-        })
-        .collect();
+    let items = visible_list_items(
+        &app.metrics,
+        metric_start,
+        metric_height,
+        app.selected,
+        |metric| format!("{} = {:.3}", metric.name, metric.value),
+    );
 
     let metric_list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Metrics"))
@@ -85,26 +80,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(8), Constraint::Min(8)])
         .split(body[1]);
 
-    let detail_text = match app.selected_metric() {
-        Some(metric) => {
-            let labels = if metric.labels.is_empty() {
-                String::from("none")
-            } else {
-                metric
-                    .labels
-                    .iter()
-                    .map(|(key, value)| format!("{key}=\"{value}\""))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-
-            format!(
-                "name: {}\nvalue: {}\n\nlabels:\n{}",
-                metric.name, metric.value, labels
-            )
-        }
-        None => String::from("no metrics loaded"),
-    };
+    let detail_text = app
+        .selected_metric()
+        .map(format_metric_details)
+        .unwrap_or_else(|| String::from("no metrics loaded"));
 
     let detail =
         Paragraph::new(detail_text).block(Block::default().borders(Borders::ALL).title("Details"));
@@ -132,22 +111,13 @@ fn render_target_picker(frame: &mut Frame, app: &App) {
 
     let visible = area.height.saturating_sub(2) as usize;
     let start = window_start(app.target_cursor, app.target_options.len(), visible);
-    let items: Vec<ListItem> = app
-        .target_options
-        .iter()
-        .skip(start)
-        .take(visible)
-        .enumerate()
-        .map(|(offset, target)| {
-            let index = start + offset;
-            let prefix = if index == app.target_cursor {
-                "> "
-            } else {
-                "  "
-            };
-            ListItem::new(format!("{prefix}{}", target.display()))
-        })
-        .collect();
+    let items = visible_list_items(
+        &app.target_options,
+        start,
+        visible,
+        app.target_cursor,
+        |target| target.to_string(),
+    );
 
     let picker = List::new(items).block(
         Block::default()
@@ -194,12 +164,7 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
 fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
     let history = app.selected_metric_history();
     if history.is_empty() {
-        let empty = Paragraph::new("no history yet").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("History (Graph)"),
-        );
-        frame.render_widget(empty, area);
+        render_empty_history(frame, area, "History (Graph)");
         return;
     }
 
@@ -245,12 +210,7 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
 fn render_history_table(frame: &mut Frame, app: &App, area: Rect) {
     let history = app.selected_metric_history();
     if history.is_empty() {
-        let empty = Paragraph::new("no history yet").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("History (Table)"),
-        );
-        frame.render_widget(empty, area);
+        render_empty_history(frame, area, "History (Table)");
         return;
     }
 
@@ -294,4 +254,54 @@ fn window_start(selected: usize, len: usize, visible: usize) -> usize {
     selected
         .saturating_sub(visible.saturating_sub(1))
         .min(max_start)
+}
+
+fn visible_list_items<T, F>(
+    items: &[T],
+    start: usize,
+    visible: usize,
+    selected: usize,
+    render_item: F,
+) -> Vec<ListItem<'_>>
+where
+    F: Fn(&T) -> String,
+{
+    items
+        .iter()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+        .map(|(offset, item)| {
+            let prefix = if start + offset == selected { "> " } else { "  " };
+            ListItem::new(format!("{prefix}{}", render_item(item)))
+        })
+        .collect()
+}
+
+fn format_metric_details(metric: &MetricSample) -> String {
+    format!(
+        "name: {}\nvalue: {}\n\nlabels:\n{}",
+        metric.name,
+        metric.value,
+        format_metric_labels(metric)
+    )
+}
+
+fn format_metric_labels(metric: &MetricSample) -> String {
+    if metric.labels.is_empty() {
+        String::from("none")
+    } else {
+        metric
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}=\"{value}\""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn render_empty_history(frame: &mut Frame, area: Rect, title: &str) {
+    let empty = Paragraph::new("no history yet")
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(empty, area);
 }

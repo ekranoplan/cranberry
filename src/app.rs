@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use tracing::{error, info, warn};
 
 const HISTORY_LIMIT: usize = 60;
@@ -41,7 +42,10 @@ pub struct TargetFilter {
 #[derive(Clone, Debug)]
 enum DataSource {
     Sample,
-    PrometheusApi { base_url: String },
+    PrometheusApi {
+        base_url: String,
+        client: reqwest::blocking::Client,
+    },
 }
 
 impl App {
@@ -72,21 +76,15 @@ impl App {
     }
 
     pub fn next(&mut self) {
-        if self.metrics.is_empty() {
-            return;
+        if let Some(next) = wrapping_next(self.selected, self.metrics.len()) {
+            self.selected = next;
         }
-        self.selected = (self.selected + 1) % self.metrics.len();
     }
 
     pub fn previous(&mut self) {
-        if self.metrics.is_empty() {
-            return;
+        if let Some(prev) = wrapping_prev(self.selected, self.metrics.len()) {
+            self.selected = prev;
         }
-        self.selected = if self.selected == 0 {
-            self.metrics.len() - 1
-        } else {
-            self.selected - 1
-        };
     }
 
     pub fn selected_metric(&self) -> Option<&MetricSample> {
@@ -101,27 +99,21 @@ impl App {
     }
 
     pub fn next_target(&mut self) {
-        if self.target_options.is_empty() {
-            return;
+        if let Some(next) = wrapping_next(self.target_selected, self.target_options.len()) {
+            self.target_selected = next;
+            self.target_cursor = self.target_selected;
+            info!(target = %self.selected_target(), "selected next target");
+            self.apply_target_selection();
         }
-        self.target_selected = (self.target_selected + 1) % self.target_options.len();
-        self.target_cursor = self.target_selected;
-        info!(target = %self.selected_target().display(), "selected next target");
-        self.apply_target_selection();
     }
 
     pub fn previous_target(&mut self) {
-        if self.target_options.is_empty() {
-            return;
+        if let Some(prev) = wrapping_prev(self.target_selected, self.target_options.len()) {
+            self.target_selected = prev;
+            self.target_cursor = self.target_selected;
+            info!(target = %self.selected_target(), "selected previous target");
+            self.apply_target_selection();
         }
-        self.target_selected = if self.target_selected == 0 {
-            self.target_options.len() - 1
-        } else {
-            self.target_selected - 1
-        };
-        self.target_cursor = self.target_selected;
-        info!(target = %self.selected_target().display(), "selected previous target");
-        self.apply_target_selection();
     }
 
     pub fn selected_target(&self) -> &TargetFilter {
@@ -152,11 +144,7 @@ impl App {
 
     pub fn close_filter_input(&mut self) {
         self.filter_input_open = false;
-        self.status = format!(
-            "loaded {} metrics for {}",
-            self.metrics.len(),
-            self.selected_target().display()
-        );
+        self.update_loaded_status();
         info!(filter = %self.filter_query, metrics = self.metrics.len(), "closed filter input");
     }
 
@@ -188,35 +176,25 @@ impl App {
         self.target_picker_open = true;
         self.target_cursor = self.target_selected;
         self.status = String::from("select target and press Enter");
-        info!(current_target = %self.selected_target().display(), "opened target picker");
+        info!(current_target = %self.selected_target(), "opened target picker");
     }
 
     pub fn close_target_picker(&mut self) {
         self.target_picker_open = false;
-        self.status = format!(
-            "loaded {} metrics for {}",
-            self.metrics.len(),
-            self.selected_target().display()
-        );
-        info!(target = %self.selected_target().display(), "closed target picker");
+        self.update_loaded_status();
+        info!(target = %self.selected_target(), "closed target picker");
     }
 
     pub fn picker_next(&mut self) {
-        if self.target_options.is_empty() {
-            return;
+        if let Some(next) = wrapping_next(self.target_cursor, self.target_options.len()) {
+            self.target_cursor = next;
         }
-        self.target_cursor = (self.target_cursor + 1) % self.target_options.len();
     }
 
     pub fn picker_previous(&mut self) {
-        if self.target_options.is_empty() {
-            return;
+        if let Some(prev) = wrapping_prev(self.target_cursor, self.target_options.len()) {
+            self.target_cursor = prev;
         }
-        self.target_cursor = if self.target_cursor == 0 {
-            self.target_options.len() - 1
-        } else {
-            self.target_cursor - 1
-        };
     }
 
     pub fn picker_apply(&mut self) {
@@ -225,7 +203,7 @@ impl App {
         }
         self.target_selected = self.target_cursor;
         self.target_picker_open = false;
-        info!(target = %self.selected_target().display(), "applied target picker selection");
+        info!(target = %self.selected_target(), "applied target picker selection");
         self.apply_target_selection();
     }
 
@@ -236,13 +214,13 @@ impl App {
                 self.source_label = String::from("sample");
                 self.reload_from_str(SAMPLE_PROMETHEUS);
             }
-            DataSource::PrometheusApi { base_url } => {
+            DataSource::PrometheusApi { base_url, client } => {
                 let base_url = base_url.clone();
+                let client = client.clone();
                 self.source_label = base_url.clone();
-                if let Err(err) = self.reload_prometheus(&base_url) {
-                    error!(%base_url, error = %err, "reload from prometheus failed");
-                    self.reset_failed_state(format!("fetch error: {err}"));
-                }
+                self.run_prometheus_reload(&base_url, &client, |app, url, http| {
+                    app.reload_prometheus(url, http)
+                });
             }
         }
     }
@@ -261,18 +239,26 @@ impl App {
         }
     }
 
-    fn reload_prometheus(&mut self, base_url: &str) -> Result<(), String> {
+    fn reload_prometheus(
+        &mut self,
+        base_url: &str,
+        client: &reqwest::blocking::Client,
+    ) -> Result<(), String> {
         let previous = self.target_options.get(self.target_selected).cloned();
         info!(%base_url, "fetching targets from prometheus");
-        let targets = fetch_targets(base_url)?;
+        let targets = fetch_targets(base_url, client)?;
         info!(%base_url, targets = targets.len(), "fetched targets from prometheus");
         self.target_options = targets;
+        self.restore_target_selection(previous);
+        self.target_picker_open = false;
+        self.load_selected_target_metrics(base_url, client)
+    }
+
+    fn restore_target_selection(&mut self, previous: Option<TargetFilter>) {
         self.target_selected = previous
             .and_then(|current| self.target_options.iter().position(|item| item == &current))
             .unwrap_or(0);
         self.target_cursor = self.target_selected;
-        self.target_picker_open = false;
-        self.load_selected_target_metrics(base_url)
     }
 
     fn set_metrics(&mut self, metrics: Vec<MetricSample>) {
@@ -284,7 +270,7 @@ impl App {
         info!(
             loaded_metrics = self.all_metrics.len(),
             visible_metrics = self.metrics.len(),
-            target = %self.selected_target().display(),
+            target = %self.selected_target(),
             "updated metrics state"
         );
     }
@@ -303,32 +289,36 @@ impl App {
     }
 
     fn apply_target_selection(&mut self) {
-        info!(target = %self.selected_target().display(), "applying target selection");
+        info!(target = %self.selected_target(), "applying target selection");
         match &self.source {
             DataSource::Sample => {
                 let previous_selection = self.selected_metric_key();
                 self.rebuild_metrics_view(previous_selection.as_ref());
             }
-            DataSource::PrometheusApi { base_url } => {
+            DataSource::PrometheusApi { base_url, client } => {
                 let base_url = base_url.clone();
-                if let Err(err) = self.load_selected_target_metrics(&base_url) {
-                    error!(%base_url, error = %err, "loading selected target metrics failed");
-                    self.reset_failed_state(format!("fetch error: {err}"));
-                }
+                let client = client.clone();
+                self.run_prometheus_reload(&base_url, &client, |app, url, http| {
+                    app.load_selected_target_metrics(url, http)
+                });
             }
         }
     }
 
-    fn load_selected_target_metrics(&mut self, base_url: &str) -> Result<(), String> {
+    fn load_selected_target_metrics(
+        &mut self,
+        base_url: &str,
+        client: &reqwest::blocking::Client,
+    ) -> Result<(), String> {
         let previous_selection = self.selected_metric_key();
-        info!(%base_url, target = %self.selected_target().display(), "fetching target metrics");
-        let metrics = fetch_target_metrics(base_url, self.selected_target())?;
+        info!(%base_url, target = %self.selected_target(), "fetching target metrics");
+        let metrics = fetch_target_metrics(base_url, self.selected_target(), client)?;
         self.all_metrics = metrics;
         self.record_metric_history();
         self.rebuild_metrics_view(previous_selection.as_ref());
         info!(
             %base_url,
-            target = %self.selected_target().display(),
+            target = %self.selected_target(),
             metrics = self.all_metrics.len(),
             "loaded target metrics"
         );
@@ -338,17 +328,15 @@ impl App {
     fn refresh_target_options(&mut self) {
         let previous = self.target_options.get(self.target_selected).cloned();
         let filters = self.all_metrics.iter().filter_map(|metric| {
-            let job = label_value(metric, "job")?;
+            let job = label_value(metric, "job")?.to_owned();
             let target = label_value(metric, "instance")
                 .or_else(|| label_value(metric, "target"))
+                .map(str::to_owned)
                 .unwrap_or_else(|| String::from("-"));
             Some(TargetFilter { job, target })
         });
         self.target_options = build_target_options(filters);
-        self.target_selected = previous
-            .and_then(|current| self.target_options.iter().position(|item| item == &current))
-            .unwrap_or(0);
-        self.target_cursor = self.target_selected;
+        self.restore_target_selection(previous);
     }
 
     fn rebuild_metrics_view(&mut self, previous_selection: Option<&MetricKey>) {
@@ -366,14 +354,10 @@ impl App {
 
         self.restore_selection(previous_selection);
 
-        self.status = format!(
-            "loaded {} metrics for {}",
-            self.metrics.len(),
-            self.selected_target().display()
-        );
+        self.update_loaded_status();
         info!(
             visible_metrics = self.metrics.len(),
-            target = %self.selected_target().display(),
+            target = %self.selected_target(),
             filter = %self.filter_query,
             "rebuilt metrics view"
         );
@@ -432,8 +416,8 @@ impl App {
         let metric_job = label_value(metric, "job");
         let metric_target =
             label_value(metric, "instance").or_else(|| label_value(metric, "target"));
-        metric_job.as_deref() == Some(selected.job.as_str())
-            && metric_target.as_deref() == Some(selected.target.as_str())
+        metric_job == Some(selected.job.as_str())
+            && metric_target == Some(selected.target.as_str())
     }
 
     fn matches_filter_with(&self, needle: &str, metric: &MetricSample) -> bool {
@@ -448,7 +432,27 @@ impl App {
         metric
             .labels
             .iter()
-            .any(|(key, value)| format!("{key}={value}").to_lowercase().contains(needle))
+            .any(|(key, value)| {
+                key.to_lowercase().contains(needle) || value.to_lowercase().contains(needle)
+            })
+    }
+
+    fn update_loaded_status(&mut self) {
+        self.status = format!("loaded {} metrics for {}", self.metrics.len(), self.selected_target());
+    }
+
+    fn run_prometheus_reload<F>(
+        &mut self,
+        base_url: &str,
+        client: &reqwest::blocking::Client,
+        reload: F,
+    ) where
+        F: FnOnce(&mut Self, &str, &reqwest::blocking::Client) -> Result<(), String>,
+    {
+        if let Err(err) = reload(self, base_url, client) {
+            error!(%base_url, error = %err, "reload from prometheus failed");
+            self.reset_failed_state(format!("fetch error: {err}"));
+        }
     }
 }
 
@@ -462,11 +466,14 @@ impl TargetFilter {
         }
     }
 
-    pub fn display(&self) -> String {
+}
+
+impl fmt::Display for TargetFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.job == "*" {
-            String::from("all targets")
+            f.write_str("all targets")
         } else {
-            format!("{}/{}", self.job, self.target)
+            write!(f, "{}/{}", self.job, self.target)
         }
     }
 }
@@ -490,9 +497,30 @@ http_requests_total{method="GET",code="200"} 128
 http_requests_total{method="GET",code="500"} 3
 "#;
 
+fn wrapping_next(index: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        None
+    } else {
+        Some((index + 1) % len)
+    }
+}
+
+fn wrapping_prev(index: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        None
+    } else if index == 0 {
+        Some(len - 1)
+    } else {
+        Some(index - 1)
+    }
+}
+
 fn build_source(prometheus: PrometheusConfig) -> DataSource {
     match prometheus.base_url {
-        Some(base_url) => DataSource::PrometheusApi { base_url },
+        Some(base_url) => DataSource::PrometheusApi {
+            base_url,
+            client: reqwest::blocking::Client::new(),
+        },
         None => DataSource::Sample,
     }
 }
@@ -501,13 +529,15 @@ impl App {
     fn data_source_label(&self) -> &str {
         match &self.source {
             DataSource::Sample => "sample",
-            DataSource::PrometheusApi { base_url } => base_url.as_str(),
+            DataSource::PrometheusApi { base_url, .. } => base_url.as_str(),
         }
     }
 }
 
-fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
-    let client = reqwest::blocking::Client::new();
+fn fetch_targets(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<Vec<TargetFilter>, String> {
     let response = client
         .get(format!("{}/api/v1/series", base_url.trim_end_matches('/')))
         .query(&[("match[]", "up")])
@@ -542,8 +572,8 @@ fn fetch_targets(base_url: &str) -> Result<Vec<TargetFilter>, String> {
 fn fetch_target_metrics(
     base_url: &str,
     target: &TargetFilter,
+    client: &reqwest::blocking::Client,
 ) -> Result<Vec<MetricSample>, String> {
-    let client = reqwest::blocking::Client::new();
     let expr = if target.job == "*" {
         String::from("{job!=\"\"}")
     } else {
@@ -562,7 +592,7 @@ fn fetch_target_metrics(
         .map_err(|err| {
             error!(
                 %base_url,
-                target = %target.display(),
+                target = %target,
                 query = %expr,
                 error = %err,
                 "prometheus metric request failed"
@@ -572,7 +602,7 @@ fn fetch_target_metrics(
     let response = response.error_for_status().map_err(|err| {
         error!(
             %base_url,
-            target = %target.display(),
+            target = %target,
             query = %expr,
             error = %err,
             "prometheus metric response returned error status"
@@ -582,7 +612,7 @@ fn fetch_target_metrics(
     let payload: QueryResponse = response.json().map_err(|err| {
         error!(
             %base_url,
-            target = %target.display(),
+            target = %target,
             error = %err,
             "failed to decode prometheus metric response"
         );
@@ -592,7 +622,7 @@ fn fetch_target_metrics(
     if payload.status != "success" {
         error!(
             %base_url,
-            target = %target.display(),
+            target = %target,
             status = %payload.status,
             "prometheus metric query returned non-success status"
         );
@@ -600,13 +630,13 @@ fn fetch_target_metrics(
     }
 
     let data = payload.data.ok_or_else(|| {
-        error!(%base_url, target = %target.display(), "prometheus metric response missing data");
+        error!(%base_url, target = %target, "prometheus metric response missing data");
         String::from("missing response data")
     })?;
     if data.result_type != "vector" {
         error!(
             %base_url,
-            target = %target.display(),
+            target = %target,
             result_type = %data.result_type,
             "unsupported prometheus result type"
         );
@@ -692,12 +722,12 @@ fn escape_matcher(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn label_value(metric: &MetricSample, key: &str) -> Option<String> {
+fn label_value<'a>(metric: &'a MetricSample, key: &str) -> Option<&'a str> {
     metric
         .labels
         .iter()
         .find(|(label_key, _)| label_key == key)
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| value.as_str())
 }
 
 fn metric_key(metric: &MetricSample) -> MetricKey {
@@ -706,7 +736,9 @@ fn metric_key(metric: &MetricSample) -> MetricKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, HistoryView, TargetFilter};
+    use super::{
+        label_value, wrapping_next, wrapping_prev, App, HistoryView, MetricSample, TargetFilter,
+    };
     use crate::config::{DisplayConfig, PrometheusConfig};
 
     #[test]
@@ -901,5 +933,38 @@ mod tests {
         app.toggle_history_view();
         assert_eq!(app.history_view, HistoryView::Graph);
         assert_eq!(app.status, "history view: graph");
+    }
+
+    #[test]
+    fn wrapping_helpers_handle_empty_and_wrap() {
+        assert_eq!(wrapping_next(0, 0), None);
+        assert_eq!(wrapping_prev(0, 0), None);
+        assert_eq!(wrapping_next(2, 3), Some(0));
+        assert_eq!(wrapping_prev(0, 3), Some(2));
+    }
+
+    #[test]
+    fn target_filter_display_matches_existing_labels() {
+        assert_eq!(TargetFilter::wildcard().to_string(), "all targets");
+        assert_eq!(
+            TargetFilter {
+                job: String::from("api"),
+                target: String::from("a:9090"),
+            }
+            .to_string(),
+            "api/a:9090"
+        );
+    }
+
+    #[test]
+    fn label_value_returns_borrowed_text() {
+        let metric = MetricSample {
+            name: String::from("up"),
+            labels: vec![(String::from("job"), String::from("node"))],
+            value: 1.0,
+        };
+
+        assert_eq!(label_value(&metric, "job"), Some("node"));
+        assert_eq!(label_value(&metric, "instance"), None);
     }
 }

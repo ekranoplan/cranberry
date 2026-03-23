@@ -5,6 +5,7 @@ mod prometheus;
 mod ui;
 
 use std::env;
+use std::error::Error;
 use std::io;
 use std::time::Duration;
 use std::time::Instant;
@@ -12,14 +13,14 @@ use std::time::Instant;
 use app::App;
 use config::Config;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tracing::info;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let config = load_config(env::args().skip(1).collect())?;
     if let Err(err) = logging::init(&config.logging) {
         eprintln!("logging initialization failed: {err}");
@@ -51,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: Config,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let refresh_interval = config
         .display
         .refresh_secs
@@ -76,61 +77,37 @@ fn run_app(
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
 
-                if app.target_picker_open {
-                    match key.code {
-                        KeyCode::Esc => app.close_target_picker(),
-                        KeyCode::Enter => app.picker_apply(),
-                        KeyCode::Down | KeyCode::Char('j') => app.picker_next(),
-                        KeyCode::Up | KeyCode::Char('k') => app.picker_previous(),
-                        KeyCode::Char('q') => break,
-                        _ => {}
-                    }
-                } else if app.filter_input_open {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Enter => app.close_filter_input(),
-                        KeyCode::Backspace => app.pop_filter_char(),
-                        KeyCode::Char('u')
-                            if key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                        {
-                            app.clear_filter()
-                        }
-                        KeyCode::Char(ch) => app.push_filter_char(ch),
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                        KeyCode::Char('h') => app.toggle_history_view(),
-                        KeyCode::Char('[') => app.previous_target(),
-                        KeyCode::Char(']') => app.next_target(),
-                        KeyCode::Char('t') => app.open_target_picker(),
-                        KeyCode::Char('/') => app.open_filter_input(),
-                        KeyCode::Char('r') => {
-                            info!("manual reload triggered");
-                            app.reload();
-                            last_reload = Instant::now();
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        let action = if app.target_picker_open {
+            handle_target_picker_key(&mut app, key)
+        } else if app.filter_input_open {
+            handle_filter_key(&mut app, key)
+        } else {
+            handle_main_key(&mut app, key)
+        };
+
+        match action {
+            AppAction::Continue => {}
+            AppAction::Reloaded => last_reload = Instant::now(),
+            AppAction::Quit => break,
         }
     }
 
     Ok(())
 }
 
-fn load_config(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
+fn load_config(args: Vec<String>) -> Result<Config, Box<dyn Error>> {
     let mut config_path = String::from("cranberry.toml");
     let mut base_url_override = None;
 
@@ -163,4 +140,56 @@ fn load_config(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> 
     }
 
     Ok(config)
+}
+
+enum AppAction {
+    Continue,
+    Reloaded,
+    Quit,
+}
+
+fn handle_target_picker_key(app: &mut App, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Esc => app.close_target_picker(),
+        KeyCode::Enter => app.picker_apply(),
+        KeyCode::Down | KeyCode::Char('j') => app.picker_next(),
+        KeyCode::Up | KeyCode::Char('k') => app.picker_previous(),
+        KeyCode::Char('q') => return AppAction::Quit,
+        _ => {}
+    }
+
+    AppAction::Continue
+}
+
+fn handle_filter_key(app: &mut App, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => app.close_filter_input(),
+        KeyCode::Backspace => app.pop_filter_char(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.clear_filter(),
+        KeyCode::Char(ch) => app.push_filter_char(ch),
+        _ => {}
+    }
+
+    AppAction::Continue
+}
+
+fn handle_main_key(app: &mut App, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Char('q') => return AppAction::Quit,
+        KeyCode::Down | KeyCode::Char('j') => app.next(),
+        KeyCode::Up | KeyCode::Char('k') => app.previous(),
+        KeyCode::Char('h') => app.toggle_history_view(),
+        KeyCode::Char('[') => app.previous_target(),
+        KeyCode::Char(']') => app.next_target(),
+        KeyCode::Char('t') => app.open_target_picker(),
+        KeyCode::Char('/') => app.open_filter_input(),
+        KeyCode::Char('r') => {
+            info!("manual reload triggered");
+            app.reload();
+            return AppAction::Reloaded;
+        }
+        _ => {}
+    }
+
+    AppAction::Continue
 }
