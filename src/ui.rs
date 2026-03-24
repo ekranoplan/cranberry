@@ -183,9 +183,14 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
 fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
     let history = app.selected_metric_history();
     if history.is_empty() {
-        render_empty_history(frame, area, "History (Graph)");
+        render_empty_history(
+            frame,
+            area,
+            &history_title("History (Graph)", selected_metric_unit(app)),
+        );
         return;
     }
+    let unit = selected_metric_unit(app);
 
     let min = history.iter().copied().fold(f64::INFINITY, f64::min);
     let max = history.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -211,7 +216,7 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("History (Graph)"),
+                .title(history_title("History (Graph)", unit)),
         )
         .x_axis(
             Axis::default()
@@ -219,8 +224,8 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
                 .labels(vec![Line::from("old"), Line::from("now")]),
         )
         .y_axis(Axis::default().bounds([min, max]).labels(vec![
-            Line::from(format!("{min:.3}")),
-            Line::from(format!("{max:.3}")),
+            Line::from(format_history_value(min, unit)),
+            Line::from(format_history_value(max, unit)),
         ]));
 
     frame.render_widget(chart, area);
@@ -228,17 +233,60 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_history_table(frame: &mut Frame, app: &App, area: Rect) {
     let history = app.selected_metric_history();
+    let unit = selected_metric_unit(app);
     if history.is_empty() {
-        render_empty_history(frame, area, "History (Table)");
+        render_empty_history(frame, area, &history_title("History (Table)", unit));
         return;
     }
 
     let visible_rows = area.height.saturating_sub(3) as usize;
-    let start = history.len().saturating_sub(visible_rows.max(1));
-    let rows: Vec<Row> = history
+    let rows: Vec<Row> = history_table_rows(&history, visible_rows, unit)
+        .into_iter()
+        .map(|(point, value, delta)| {
+            Row::new(vec![
+                Cell::from(point),
+                Cell::from(value),
+                Cell::from(delta),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Min(12),
+            Constraint::Min(12),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            String::from("Sample"),
+            history_column_title("Value", unit),
+            history_column_title("Delta", unit),
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(history_title("History (Table)", unit)),
+    )
+    .column_spacing(1);
+
+    frame.render_widget(table, area);
+}
+
+fn history_table_rows(
+    history: &[f64],
+    visible_rows: usize,
+    unit: Option<&str>,
+) -> Vec<(String, String, String)> {
+    history
         .iter()
         .enumerate()
-        .skip(start)
+        .rev()
+        .take(visible_rows.max(1))
         .map(|(index, value)| {
             let age = history.len().saturating_sub(index + 1);
             let point = if age == 0 {
@@ -246,22 +294,69 @@ fn render_history_table(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("-{age}")
             };
-            Row::new(vec![Cell::from(point), Cell::from(format!("{value:.3}"))])
+            let delta = if index == 0 {
+                String::from("n/a")
+            } else {
+                format_delta(history[index] - history[index - 1], unit)
+            };
+            (point, format_history_value(*value, unit), delta)
         })
-        .collect();
+        .collect()
+}
 
-    let table = Table::new(rows, [Constraint::Length(8), Constraint::Min(12)])
-        .header(
-            Row::new(vec!["Sample", "Value"]).style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("History (Table)"),
-        )
-        .column_spacing(1);
+fn selected_metric_unit(app: &App) -> Option<&str> {
+    app.selected_metric()
+        .and_then(|metric| metric_unit_from_name(&metric.name))
+}
 
-    frame.render_widget(table, area);
+fn metric_unit_from_name(name: &str) -> Option<&str> {
+    let mut parts: Vec<&str> = name.split('_').filter(|part| !part.is_empty()).collect();
+    while matches!(
+        parts.last().copied(),
+        Some("total" | "sum" | "count" | "bucket" | "info" | "created")
+    ) {
+        parts.pop();
+    }
+
+    if parts.len() < 2 {
+        None
+    } else {
+        match parts.last().copied() {
+            Some(
+                unit @ ("seconds" | "bytes" | "meters" | "celsius" | "volts" | "amperes" | "joules"
+                | "grams" | "ratio"),
+            ) => Some(unit),
+            _ => None,
+        }
+    }
+}
+
+fn history_title(base: &str, unit: Option<&str>) -> String {
+    match unit {
+        Some(unit) => format!("{base} [{unit}]"),
+        None => base.to_string(),
+    }
+}
+
+fn history_column_title(base: &str, unit: Option<&str>) -> String {
+    match unit {
+        Some(unit) => format!("{base} ({unit})"),
+        None => base.to_string(),
+    }
+}
+
+fn format_history_value(value: f64, unit: Option<&str>) -> String {
+    match unit {
+        Some(unit) => format!("{value:.3} {unit}"),
+        None => format!("{value:.3}"),
+    }
+}
+
+fn format_delta(delta: f64, unit: Option<&str>) -> String {
+    match unit {
+        Some(unit) => format!("{delta:+.3} {unit}"),
+        None => format!("{delta:+.3}"),
+    }
 }
 
 fn window_start(selected: usize, len: usize, visible: usize) -> usize {
@@ -327,4 +422,87 @@ fn render_empty_history(frame: &mut Frame, area: Rect, title: &str) {
     let empty =
         Paragraph::new("no history yet").block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(empty, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{history_column_title, history_table_rows, history_title, metric_unit_from_name};
+
+    #[test]
+    fn history_table_rows_show_latest_first() {
+        let rows = history_table_rows(&[70.0, 71.0, 69.0], 10, None);
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    String::from("now"),
+                    String::from("69.000"),
+                    String::from("-2.000"),
+                ),
+                (
+                    String::from("-1"),
+                    String::from("71.000"),
+                    String::from("+1.000"),
+                ),
+                (
+                    String::from("-2"),
+                    String::from("70.000"),
+                    String::from("n/a"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_table_rows_respect_visible_limit() {
+        let rows = history_table_rows(&[70.0, 71.0, 69.0], 2, None);
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    String::from("now"),
+                    String::from("69.000"),
+                    String::from("-2.000"),
+                ),
+                (
+                    String::from("-1"),
+                    String::from("71.000"),
+                    String::from("+1.000"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_metric_units_from_prometheus_names() {
+        assert_eq!(
+            metric_unit_from_name("process_cpu_seconds_total"),
+            Some("seconds")
+        );
+        assert_eq!(
+            metric_unit_from_name("process_resident_memory_bytes"),
+            Some("bytes")
+        );
+        assert_eq!(
+            metric_unit_from_name("http_request_duration_seconds_bucket"),
+            Some("seconds")
+        );
+        assert_eq!(metric_unit_from_name("http_requests_total"), None);
+        assert_eq!(metric_unit_from_name("up"), None);
+    }
+
+    #[test]
+    fn appends_units_to_history_labels() {
+        assert_eq!(
+            history_title("History (Table)", Some("seconds")),
+            "History (Table) [seconds]"
+        );
+        assert_eq!(
+            history_column_title("Delta", Some("bytes")),
+            "Delta (bytes)"
+        );
+        assert_eq!(history_column_title("Value", None), "Value");
+    }
 }
