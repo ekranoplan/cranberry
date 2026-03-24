@@ -11,7 +11,7 @@ const HISTORY_LIMIT: usize = 60;
 
 pub struct App {
     pub metrics: Vec<MetricSample>,
-    pub selected: usize,
+    pub cursor: usize,
     pub status: String,
     pub source_label: String,
     pub filter_query: String,
@@ -25,6 +25,7 @@ pub struct App {
     display: DisplayConfig,
     all_metrics: Vec<MetricSample>,
     metric_history: BTreeMap<MetricKey, VecDeque<f64>>,
+    selected_metrics: BTreeSet<MetricKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +56,7 @@ impl App {
 
         let mut app = Self {
             metrics: Vec::new(),
-            selected: 0,
+            cursor: 0,
             status: String::from("initializing"),
             source_label: String::new(),
             filter_query: String::new(),
@@ -69,6 +70,7 @@ impl App {
             display,
             all_metrics: Vec::new(),
             metric_history: BTreeMap::new(),
+            selected_metrics: BTreeSet::new(),
         };
         info!(refresh_secs, "app initialized");
         app.reload();
@@ -76,19 +78,19 @@ impl App {
     }
 
     pub fn next(&mut self) {
-        if let Some(next) = wrapping_next(self.selected, self.metrics.len()) {
-            self.selected = next;
+        if let Some(next) = wrapping_next(self.cursor, self.metrics.len()) {
+            self.cursor = next;
         }
     }
 
     pub fn previous(&mut self) {
-        if let Some(prev) = wrapping_prev(self.selected, self.metrics.len()) {
-            self.selected = prev;
+        if let Some(prev) = wrapping_prev(self.cursor, self.metrics.len()) {
+            self.cursor = prev;
         }
     }
 
     pub fn selected_metric(&self) -> Option<&MetricSample> {
-        self.metrics.get(self.selected)
+        self.metrics.get(self.cursor)
     }
 
     pub fn selected_metric_history(&self) -> Vec<f64> {
@@ -96,6 +98,33 @@ impl App {
             .and_then(|metric| self.metric_history.get(&metric_key(metric)))
             .map(|values| values.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    pub fn toggle_metric_selection(&mut self) {
+        let Some(metric) = self.selected_metric() else {
+            return;
+        };
+        let key = metric_key(metric);
+        let name = metric.name.clone();
+        if self.selected_metrics.remove(&key) {
+            self.status = format!("unselected {name}");
+        } else {
+            self.selected_metrics.insert(key);
+            self.status = format!("selected {name}");
+        }
+    }
+
+    pub fn clear_metric_selection(&mut self) {
+        self.selected_metrics.clear();
+        self.status = String::from("selection cleared");
+    }
+
+    pub fn is_metric_selected(&self, metric: &MetricSample) -> bool {
+        self.selected_metrics.contains(&metric_key(metric))
+    }
+
+    pub fn selected_metrics_len(&self) -> usize {
+        self.selected_metrics.len()
     }
 
     pub fn next_target(&mut self) {
@@ -284,7 +313,8 @@ impl App {
         self.target_selected = 0;
         self.target_cursor = 0;
         self.target_picker_open = false;
-        self.selected = 0;
+        self.cursor = 0;
+        self.selected_metrics.clear();
         self.status = status;
     }
 
@@ -353,6 +383,7 @@ impl App {
         }
 
         self.restore_selection(previous_selection);
+        self.retain_visible_selection();
 
         self.update_loaded_status();
         info!(
@@ -379,7 +410,7 @@ impl App {
     }
 
     fn restore_selection(&mut self, previous_selection: Option<&MetricKey>) {
-        self.selected = 0;
+        self.cursor = 0;
 
         if let Some(previous_selection) = previous_selection {
             if let Some(index) = self
@@ -387,7 +418,7 @@ impl App {
                 .iter()
                 .position(|metric| metric_key(metric) == *previous_selection)
             {
-                self.selected = index;
+                self.cursor = index;
                 return;
             }
         }
@@ -398,9 +429,15 @@ impl App {
                 .iter()
                 .position(|metric| metric.name == *initial_metric)
             {
-                self.selected = index;
+                self.cursor = index;
             }
         }
+    }
+
+    fn retain_visible_selection(&mut self) {
+        let visible_keys: BTreeSet<MetricKey> = self.metrics.iter().map(metric_key).collect();
+        self.selected_metrics
+            .retain(|metric_key| visible_keys.contains(metric_key));
     }
 
     fn selected_metric_key(&self) -> Option<MetricKey> {
@@ -416,8 +453,7 @@ impl App {
         let metric_job = label_value(metric, "job");
         let metric_target =
             label_value(metric, "instance").or_else(|| label_value(metric, "target"));
-        metric_job == Some(selected.job.as_str())
-            && metric_target == Some(selected.target.as_str())
+        metric_job == Some(selected.job.as_str()) && metric_target == Some(selected.target.as_str())
     }
 
     fn matches_filter_with(&self, needle: &str, metric: &MetricSample) -> bool {
@@ -429,16 +465,17 @@ impl App {
             return true;
         }
 
-        metric
-            .labels
-            .iter()
-            .any(|(key, value)| {
-                key.to_lowercase().contains(needle) || value.to_lowercase().contains(needle)
-            })
+        metric.labels.iter().any(|(key, value)| {
+            key.to_lowercase().contains(needle) || value.to_lowercase().contains(needle)
+        })
     }
 
     fn update_loaded_status(&mut self) {
-        self.status = format!("loaded {} metrics for {}", self.metrics.len(), self.selected_target());
+        self.status = format!(
+            "loaded {} metrics for {}",
+            self.metrics.len(),
+            self.selected_target()
+        );
     }
 
     fn run_prometheus_reload<F>(
@@ -465,7 +502,6 @@ impl TargetFilter {
             target: String::from("*"),
         }
     }
-
 }
 
 impl fmt::Display for TargetFilter {
@@ -757,8 +793,8 @@ mod tests {
         );
 
         assert_eq!(app.metrics.len(), 2);
-        assert_eq!(app.selected, 1);
-        assert_eq!(app.metrics[app.selected].name, "http_requests_total");
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.metrics[app.cursor].name, "http_requests_total");
     }
 
     #[test]
@@ -856,13 +892,13 @@ mod tests {
             "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
         );
         app.next();
-        assert_eq!(app.metrics[app.selected].name, "gpu_temperature_celsius");
+        assert_eq!(app.metrics[app.cursor].name, "gpu_temperature_celsius");
 
         app.reload_from_str(
             "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 71\nrequests_total{job=\"api\",instance=\"a:9090\"} 3\n",
         );
 
-        assert_eq!(app.metrics[app.selected].name, "gpu_temperature_celsius");
+        assert_eq!(app.metrics[app.cursor].name, "gpu_temperature_celsius");
     }
 
     #[test]
@@ -918,6 +954,67 @@ mod tests {
             Some("gpu_temperature_celsius")
         );
         assert_eq!(app.selected_metric_history(), vec![70.0, 71.0, 69.0]);
+    }
+
+    #[test]
+    fn toggles_multiple_metric_selection() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
+        );
+
+        app.toggle_metric_selection();
+        app.next();
+        app.toggle_metric_selection();
+
+        assert_eq!(app.selected_metrics_len(), 2);
+        assert!(app.is_metric_selected(&app.metrics[0]));
+        assert!(app.is_metric_selected(&app.metrics[1]));
+
+        app.previous();
+        app.toggle_metric_selection();
+
+        assert_eq!(app.selected_metrics_len(), 1);
+        assert!(!app.is_metric_selected(&app.metrics[0]));
+        assert!(app.is_metric_selected(&app.metrics[1]));
+    }
+
+    #[test]
+    fn retains_only_visible_selected_metrics_after_filtering() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\ngpu_temperature_celsius{job=\"api\",instance=\"a:9090\",gpu=\"0\"} 70\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
+        );
+
+        app.toggle_metric_selection();
+        app.next();
+        app.toggle_metric_selection();
+        assert_eq!(app.selected_metrics_len(), 2);
+
+        app.push_filter_char('g');
+        app.push_filter_char('p');
+        app.push_filter_char('u');
+
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(app.selected_metrics_len(), 1);
+        assert_eq!(app.metrics[0].name, "gpu_temperature_celsius");
+        assert!(app.is_metric_selected(&app.metrics[0]));
     }
 
     #[test]

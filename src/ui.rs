@@ -34,7 +34,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         Span::raw("  source: "),
         Span::styled(app.source_label.as_str(), Style::default().fg(Color::Green)),
         Span::raw("  target: "),
-        Span::styled(app.selected_target().to_string(), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            app.selected_target().to_string(),
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw("  refresh: "),
         Span::styled(
             format!("{}s", app.refresh_secs()),
@@ -49,6 +52,16 @@ pub fn render(frame: &mut Frame, app: &App) {
             },
             Style::default().fg(Color::Magenta),
         ),
+        Span::raw("  metrics: "),
+        Span::styled(
+            app.metrics.len().to_string(),
+            Style::default().fg(Color::LightRed),
+        ),
+        Span::raw("  selected: "),
+        Span::styled(
+            app.selected_metrics_len().to_string(),
+            Style::default().fg(Color::LightGreen),
+        ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Overview"));
 
@@ -60,13 +73,20 @@ pub fn render(frame: &mut Frame, app: &App) {
         .split(vertical[1]);
 
     let metric_height = body[0].height.saturating_sub(2) as usize;
-    let metric_start = window_start(app.selected, app.metrics.len(), metric_height);
+    let metric_start = window_start(app.cursor, app.metrics.len(), metric_height);
     let items = visible_list_items(
         &app.metrics,
         metric_start,
         metric_height,
-        app.selected,
-        |metric| format!("{} = {:.3}", metric.name, metric.value),
+        app.cursor,
+        |metric| {
+            let marker = if app.is_metric_selected(metric) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            format!("{marker} {} = {:.3}", metric.name, metric.value)
+        },
     );
 
     let metric_list = List::new(items)
@@ -91,11 +111,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_history(frame, app, detail_layout[1]);
 
-    let footer = Paragraph::new(format!(
-        "{} | q quit | j/k move | h history view | t target picker | / filter | r reload now",
-        app.status
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Status"));
+    let footer = Paragraph::new(
+        "q quit | j/k move | Space toggle select | c clear select | h history view | t target picker | / filter | r reload now",
+    )
+    .block(Block::default().borders(Borders::ALL).title("Help"));
     frame.render_widget(footer, vertical[2]);
 
     if app.target_picker_open {
@@ -272,7 +291,11 @@ where
         .take(visible)
         .enumerate()
         .map(|(offset, item)| {
-            let prefix = if start + offset == selected { "> " } else { "  " };
+            let prefix = if start + offset == selected {
+                "> "
+            } else {
+                "  "
+            };
             ListItem::new(format!("{prefix}{}", render_item(item)))
         })
         .collect()
@@ -301,7 +324,7 @@ fn format_metric_labels(metric: &MetricSample) -> String {
 }
 
 fn render_empty_history(frame: &mut Frame, area: Rect, title: &str) {
-    let empty = Paragraph::new("no history yet")
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let empty =
+        Paragraph::new("no history yet").block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(empty, area);
 }

@@ -178,6 +178,8 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> AppAction {
         KeyCode::Char('q') => return AppAction::Quit,
         KeyCode::Down | KeyCode::Char('j') => app.next(),
         KeyCode::Up | KeyCode::Char('k') => app.previous(),
+        KeyCode::Char(' ') => app.toggle_metric_selection(),
+        KeyCode::Char('c') => app.clear_metric_selection(),
         KeyCode::Char('h') => app.toggle_history_view(),
         KeyCode::Char('[') => app.previous_target(),
         KeyCode::Char(']') => app.next_target(),
