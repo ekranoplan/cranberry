@@ -426,7 +426,7 @@ fn render_empty_history(frame: &mut Frame, area: Rect, title: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_column_title, history_table_rows, history_title, metric_unit_from_name};
+    use super::{history_table_rows, metric_unit_from_name};
 
     #[test]
     fn history_table_rows_show_latest_first() {
@@ -494,15 +494,23 @@ mod tests {
     }
 
     #[test]
-    fn appends_units_to_history_labels() {
+    fn history_table_rows_include_units_in_values_and_deltas() {
+        let rows = history_table_rows(&[10.0, 12.5], 10, Some("seconds"));
+
         assert_eq!(
-            history_title("History (Table)", Some("seconds")),
-            "History (Table) [seconds]"
+            rows,
+            vec![
+                (
+                    String::from("now"),
+                    String::from("12.500 seconds"),
+                    String::from("+2.500 seconds"),
+                ),
+                (
+                    String::from("-1"),
+                    String::from("10.000 seconds"),
+                    String::from("n/a"),
+                ),
+            ]
         );
-        assert_eq!(
-            history_column_title("Delta", Some("bytes")),
-            "Delta (bytes)"
-        );
-        assert_eq!(history_column_title("Value", None), "Value");
     }
 }

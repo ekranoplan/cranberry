@@ -772,9 +772,7 @@ fn metric_key(metric: &MetricSample) -> MetricKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        label_value, wrapping_next, wrapping_prev, App, HistoryView, MetricSample, TargetFilter,
-    };
+    use super::{App, HistoryView, TargetFilter, HISTORY_LIMIT};
     use crate::config::{DisplayConfig, PrometheusConfig};
 
     #[test]
@@ -957,6 +955,25 @@ mod tests {
     }
 
     #[test]
+    fn caps_metric_history_to_history_limit() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: Some(String::from("up")),
+                refresh_secs: None,
+            },
+        );
+
+        for value in 0..(HISTORY_LIMIT + 5) {
+            app.reload_from_str(&format!("up{{job=\"api\",instance=\"a:9090\"}} {value}\n"));
+        }
+
+        let expected: Vec<f64> = (5..(HISTORY_LIMIT + 5)).map(|value| value as f64).collect();
+        assert_eq!(app.selected_metric_history(), expected);
+    }
+
+    #[test]
     fn toggles_multiple_metric_selection() {
         let mut app = App::new(
             PrometheusConfig::default(),
@@ -1018,6 +1035,58 @@ mod tests {
     }
 
     #[test]
+    fn filters_metrics_by_target_label_when_instance_is_missing() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",target=\"alpha\"} 1\nrequests_total{job=\"api\",target=\"alpha\"} 2\nup{job=\"api\",target=\"beta\"} 1\n",
+        );
+
+        assert_eq!(app.target_options.len(), 3);
+        app.next_target();
+        assert_eq!(app.selected_target().target, "alpha");
+        assert_eq!(app.metrics.len(), 2);
+
+        app.next_target();
+        assert_eq!(app.selected_target().target, "beta");
+        assert_eq!(app.metrics.len(), 1);
+    }
+
+    #[test]
+    fn resets_loaded_state_after_parse_error() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\nrequests_total{job=\"api\",instance=\"a:9090\"} 2\n",
+        );
+        app.toggle_metric_selection();
+        app.open_target_picker();
+
+        app.reload_from_str("up{job=\"api\" 1\n");
+
+        assert!(app.metrics.is_empty());
+        assert!(app.selected_metric().is_none());
+        assert_eq!(app.selected_metrics_len(), 0);
+        assert_eq!(app.target_options, vec![TargetFilter::wildcard()]);
+        assert!(!app.target_picker_open);
+        assert!(app.status.starts_with("parse error:"));
+    }
+
+    #[test]
     fn toggles_history_view_mode() {
         let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
 
@@ -1030,38 +1099,5 @@ mod tests {
         app.toggle_history_view();
         assert_eq!(app.history_view, HistoryView::Graph);
         assert_eq!(app.status, "history view: graph");
-    }
-
-    #[test]
-    fn wrapping_helpers_handle_empty_and_wrap() {
-        assert_eq!(wrapping_next(0, 0), None);
-        assert_eq!(wrapping_prev(0, 0), None);
-        assert_eq!(wrapping_next(2, 3), Some(0));
-        assert_eq!(wrapping_prev(0, 3), Some(2));
-    }
-
-    #[test]
-    fn target_filter_display_matches_existing_labels() {
-        assert_eq!(TargetFilter::wildcard().to_string(), "all targets");
-        assert_eq!(
-            TargetFilter {
-                job: String::from("api"),
-                target: String::from("a:9090"),
-            }
-            .to_string(),
-            "api/a:9090"
-        );
-    }
-
-    #[test]
-    fn label_value_returns_borrowed_text() {
-        let metric = MetricSample {
-            name: String::from("up"),
-            labels: vec![(String::from("job"), String::from("node"))],
-            value: 1.0,
-        };
-
-        assert_eq!(label_value(&metric, "job"), Some("node"));
-        assert_eq!(label_value(&metric, "instance"), None);
     }
 }

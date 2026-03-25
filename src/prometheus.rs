@@ -152,4 +152,19 @@ mod tests {
         assert_eq!(metrics[0].labels[0].1, "/api/v1,internal");
         assert_eq!(metrics[0].labels[1].1, "say \"hello\"");
     }
+
+    #[test]
+    fn reports_line_numbers_for_invalid_values() {
+        let err = parse_metrics("up 1\nrequests_total abc\n").expect_err("metric should fail");
+
+        assert_eq!(err, "invalid value at line 2");
+    }
+
+    #[test]
+    fn rejects_unclosed_label_blocks() {
+        let err = parse_metrics("up{job=\"api\",instance=\"a:9090\" 1\n")
+            .expect_err("metric should fail");
+
+        assert_eq!(err, "missing closing label brace at line 1");
+    }
 }

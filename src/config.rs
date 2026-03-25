@@ -60,6 +60,12 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::Config;
 
     #[test]
@@ -89,5 +95,28 @@ mod tests {
 
         assert_eq!(config.logging.path, "logs/cranberry-dev.log");
         assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn load_reports_parse_errors_with_file_path() {
+        let path = unique_test_path("invalid-config.toml");
+        fs::write(&path, "[logging\nlevel = \"info\"\n").expect("config file should be written");
+
+        let err = Config::load(&path).expect_err("config should fail to parse");
+
+        assert!(err.contains("failed to parse"));
+        assert!(err.contains(path.to_string_lossy().as_ref()));
+        fs::remove_file(path).expect("temporary config file should be removed");
+    }
+
+    fn unique_test_path(file_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic enough")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cranberry-config-test-{}-{nanos}-{file_name}",
+            std::process::id()
+        ))
     }
 }
