@@ -29,6 +29,8 @@ pub struct App {
     pub log_names: Vec<String>,
     pub log_name_selected: usize,
     pub log_entries: Vec<LogEntry>,
+    pub log_filter_query: String,
+    pub log_filter_input_open: bool,
     source: DataSource,
     loki: Option<LokiClient>,
     loki_poll_secs: u64,
@@ -120,6 +122,8 @@ impl App {
             log_names: Vec::new(),
             log_name_selected: 0,
             log_entries: Vec::new(),
+            log_filter_query: String::new(),
+            log_filter_input_open: false,
             source,
             loki,
             loki_poll_secs,
@@ -225,6 +229,14 @@ impl App {
             .map(String::as_str)
     }
 
+    pub fn visible_log_entries(&self) -> Vec<&LogEntry> {
+        let needle = self.log_filter_query.to_lowercase();
+        self.log_entries
+            .iter()
+            .filter(|entry| self.matches_log_filter_with(&needle, entry))
+            .collect()
+    }
+
     pub fn toggle_history_view(&mut self) {
         self.history_view = match self.history_view {
             HistoryView::Graph => HistoryView::Table,
@@ -310,6 +322,7 @@ impl App {
             return;
         }
         self.filter_input_open = false;
+        self.log_filter_input_open = false;
         self.target_picker_open = false;
         self.screen = ScreenMode::Logs;
         self.reset_log_stream();
@@ -319,6 +332,7 @@ impl App {
     }
 
     pub fn close_logs(&mut self) {
+        self.log_filter_input_open = false;
         self.screen = ScreenMode::Metrics;
         self.update_loaded_status();
     }
@@ -337,6 +351,36 @@ impl App {
 
     pub fn previous_log_option(&mut self) {
         self.advance_log_option(-1);
+    }
+
+    pub fn open_log_filter_input(&mut self) {
+        self.log_filter_input_open = true;
+        self.status = format!("filter logs: {}", self.log_filter_query);
+        info!(filter = %self.log_filter_query, "opened log filter input");
+    }
+
+    pub fn close_log_filter_input(&mut self) {
+        self.log_filter_input_open = false;
+        self.update_log_status();
+        info!(filter = %self.log_filter_query, visible_logs = self.visible_log_entries().len(), "closed log filter input");
+    }
+
+    pub fn push_log_filter_char(&mut self, ch: char) {
+        self.log_filter_query.push(ch);
+        self.status = format!("filter logs: {}", self.log_filter_query);
+        info!(filter = %self.log_filter_query, added = %ch, "updated log filter query");
+    }
+
+    pub fn pop_log_filter_char(&mut self) {
+        self.log_filter_query.pop();
+        self.status = format!("filter logs: {}", self.log_filter_query);
+        info!(filter = %self.log_filter_query, "deleted log filter character");
+    }
+
+    pub fn clear_log_filter(&mut self) {
+        self.log_filter_query.clear();
+        self.status = String::from("log filter cleared");
+        info!("cleared log filter query");
     }
 
     pub fn refresh_logs(&mut self) {
@@ -361,7 +405,7 @@ impl App {
                     let drop_len = self.log_entries.len() - 500;
                     self.log_entries.drain(0..drop_len);
                 }
-                self.status = format!("streaming logs for {host} / {log_name}");
+                self.update_log_status();
             }
             Err(err) => {
                 self.status = format!("loki log fetch error: {err}");
@@ -425,6 +469,22 @@ impl App {
                 self.status = format!("loki log labels error: {err}");
             }
         }
+    }
+
+    fn matches_log_filter_with(&self, needle: &str, entry: &LogEntry) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+
+        entry.line.to_lowercase().contains(needle)
+    }
+
+    fn update_log_status(&mut self) {
+        let host = self.selected_log_host().unwrap_or("-");
+        let log_name = self.selected_log_name().unwrap_or("-");
+        let visible_logs = self.visible_log_entries().len();
+
+        self.status = format!("streaming logs for {host} / {log_name} ({visible_logs} shown)");
     }
 
     pub fn reload(&mut self) {
@@ -1024,6 +1084,7 @@ fn metric_key(metric: &MetricSample) -> MetricKey {
 mod tests {
     use super::{App, HistoryView, TargetFilter, HISTORY_LIMIT};
     use crate::config::{DisplayConfig, PrometheusConfig};
+    use crate::loki::LogEntry;
 
     #[test]
     fn applies_display_config_after_reload() {
@@ -1227,6 +1288,54 @@ mod tests {
 
         assert_eq!(app.metrics.len(), 1);
         assert_eq!(app.metrics[0].name, "gpu_temperature_celsius");
+    }
+
+    #[test]
+    fn filters_log_entries_by_text_query() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.log_entries = vec![
+            LogEntry {
+                timestamp_ns: 1,
+                line: String::from("tailscaled: upload failed 429"),
+            },
+            LogEntry {
+                timestamp_ns: 2,
+                line: String::from("sshd: accepted publickey"),
+            },
+        ];
+
+        app.push_log_filter_char('4');
+        app.push_log_filter_char('2');
+        app.push_log_filter_char('9');
+
+        let visible = app.visible_log_entries();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].line, "tailscaled: upload failed 429");
+
+        app.clear_log_filter();
+        assert_eq!(app.visible_log_entries().len(), 2);
+    }
+
+    #[test]
+    fn keeps_log_filter_applied_when_new_entries_arrive() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.log_entries = vec![LogEntry {
+            timestamp_ns: 1,
+            line: String::from("tailscaled: upload failed 429"),
+        }];
+        app.push_log_filter_char('t');
+        app.push_log_filter_char('a');
+        app.push_log_filter_char('i');
+        app.push_log_filter_char('l');
+
+        app.log_entries.push(LogEntry {
+            timestamp_ns: 2,
+            line: String::from("kernel: link is up"),
+        });
+
+        let visible = app.visible_log_entries();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].line, "tailscaled: upload failed 429");
     }
 
     #[test]

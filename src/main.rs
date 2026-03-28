@@ -98,7 +98,9 @@ fn run_app(
             continue;
         }
 
-        let action = if app.is_logs_screen() {
+        let action = if app.is_logs_screen() && app.log_filter_input_open {
+            handle_log_filter_key(&mut app, key)
+        } else if app.is_logs_screen() {
             handle_log_key(&mut app, key)
         } else if app.target_picker_open {
             handle_target_picker_key(&mut app, key)
@@ -164,6 +166,7 @@ enum AppAction {
 fn handle_log_key(app: &mut App, key: KeyEvent) -> AppAction {
     match key.code {
         KeyCode::Esc => app.close_logs(),
+        KeyCode::Char('/') => app.open_log_filter_input(),
         KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
             app.toggle_log_focus()
         }
@@ -199,6 +202,20 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> AppAction {
         KeyCode::Backspace => app.pop_filter_char(),
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.clear_filter(),
         KeyCode::Char(ch) => app.push_filter_char(ch),
+        _ => {}
+    }
+
+    AppAction::Continue
+}
+
+fn handle_log_filter_key(app: &mut App, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => app.close_log_filter_input(),
+        KeyCode::Backspace => app.pop_log_filter_char(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.clear_log_filter()
+        }
+        KeyCode::Char(ch) => app.push_log_filter_char(ch),
         _ => {}
     }
 

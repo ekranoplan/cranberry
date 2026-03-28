@@ -158,6 +158,15 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
             app.selected_log_name().unwrap_or("-"),
             Style::default().fg(Color::Green),
         ),
+        Span::raw("  filter: "),
+        Span::styled(
+            if app.log_filter_query.is_empty() {
+                "*"
+            } else {
+                app.log_filter_query.as_str()
+            },
+            Style::default().fg(Color::Magenta),
+        ),
         Span::raw("  poll: "),
         Span::styled(
             format!("{}s", app.log_poll_secs()),
@@ -188,10 +197,10 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
         app.log_focus == LogFocus::Logs,
     );
 
+    let filtered_entries = app.visible_log_entries();
     let visible = vertical[2].height.saturating_sub(2) as usize;
-    let start = app.log_entries.len().saturating_sub(visible.max(1));
-    let lines: Vec<Line> = app
-        .log_entries
+    let start = filtered_entries.len().saturating_sub(visible.max(1));
+    let lines: Vec<Line> = filtered_entries
         .iter()
         .skip(start)
         .map(|entry| {
@@ -204,7 +213,11 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
         })
         .collect();
     let log_body = if lines.is_empty() {
-        Paragraph::new("no log lines yet")
+        Paragraph::new(if app.log_entries.is_empty() {
+            "no log lines yet"
+        } else {
+            "no matching log lines"
+        })
     } else {
         Paragraph::new(lines)
     }
@@ -212,10 +225,14 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
     frame.render_widget(log_body, vertical[2]);
 
     let footer = Paragraph::new(
-        "Esc back | Tab/h/l switch picker | j/k move | r reload labels/logs | q quit",
+        "Esc back | Tab/h/l switch picker | j/k move | / filter | r reload labels/logs | q quit",
     )
     .block(Block::default().borders(Borders::ALL).title("Help"));
     frame.render_widget(footer, vertical[3]);
+
+    if app.log_filter_input_open {
+        render_log_filter_input(frame, app);
+    }
 }
 
 fn render_target_picker(frame: &mut Frame, app: &App) {
@@ -261,6 +278,19 @@ fn render_filter_input(frame: &mut Frame, app: &App) {
     let prompt = Paragraph::new(format!(
         "Filter metrics\n\n{}\n\nEnter apply | Esc close | Backspace delete | Ctrl-U clear",
         app.filter_query
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Filter"));
+
+    frame.render_widget(prompt, area);
+}
+
+fn render_log_filter_input(frame: &mut Frame, app: &App) {
+    let area = centered_rect(frame.area(), 60, 20);
+    frame.render_widget(Clear, area);
+
+    let prompt = Paragraph::new(format!(
+        "Filter logs\n\n{}\n\nEnter apply | Esc close | Backspace delete | Ctrl-U clear",
+        app.log_filter_query
     ))
     .block(Block::default().borders(Borders::ALL).title("Filter"));
 
