@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod logging;
+mod loki;
 mod prometheus;
 mod ui;
 
@@ -62,8 +63,9 @@ fn run_app(
         refresh_secs = refresh_interval.as_secs(),
         "starting application"
     );
-    let mut app = App::new(config.prometheus, config.display);
+    let mut app = App::with_loki(config.prometheus, config.loki, config.display);
     let mut last_reload = Instant::now();
+    let mut last_log_poll = Instant::now();
 
     loop {
         if last_reload.elapsed() >= refresh_interval {
@@ -73,6 +75,13 @@ fn run_app(
             );
             app.reload();
             last_reload = Instant::now();
+        }
+
+        if app.is_logs_screen()
+            && last_log_poll.elapsed() >= Duration::from_secs(app.log_poll_secs())
+        {
+            app.refresh_logs();
+            last_log_poll = Instant::now();
         }
 
         terminal.draw(|frame| ui::render(frame, &app))?;
@@ -89,7 +98,9 @@ fn run_app(
             continue;
         }
 
-        let action = if app.target_picker_open {
+        let action = if app.is_logs_screen() {
+            handle_log_key(&mut app, key)
+        } else if app.target_picker_open {
             handle_target_picker_key(&mut app, key)
         } else if app.filter_input_open {
             handle_filter_key(&mut app, key)
@@ -100,6 +111,7 @@ fn run_app(
         match action {
             AppAction::Continue => {}
             AppAction::Reloaded => last_reload = Instant::now(),
+            AppAction::LogsReloaded => last_log_poll = Instant::now(),
             AppAction::Quit => break,
         }
     }
@@ -145,7 +157,27 @@ fn load_config(args: Vec<String>) -> Result<Config, Box<dyn Error>> {
 enum AppAction {
     Continue,
     Reloaded,
+    LogsReloaded,
     Quit,
+}
+
+fn handle_log_key(app: &mut App, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Esc => app.close_logs(),
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+            app.toggle_log_focus()
+        }
+        KeyCode::Down | KeyCode::Char('j') => app.next_log_option(),
+        KeyCode::Up | KeyCode::Char('k') => app.previous_log_option(),
+        KeyCode::Char('r') => {
+            app.reload_logs_screen();
+            return AppAction::LogsReloaded;
+        }
+        KeyCode::Char('q') => return AppAction::Quit,
+        _ => {}
+    }
+
+    AppAction::Continue
 }
 
 fn handle_target_picker_key(app: &mut App, key: KeyEvent) -> AppAction {
@@ -184,6 +216,10 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> AppAction {
         KeyCode::Char('[') => app.previous_target(),
         KeyCode::Char(']') => app.next_target(),
         KeyCode::Char('t') => app.open_target_picker(),
+        KeyCode::Char('l') => {
+            app.open_logs();
+            return AppAction::LogsReloaded;
+        }
         KeyCode::Char('/') => app.open_filter_input(),
         KeyCode::Char('r') => {
             info!("manual reload triggered");

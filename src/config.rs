@@ -7,6 +7,8 @@ pub struct Config {
     #[serde(default)]
     pub prometheus: PrometheusConfig,
     #[serde(default)]
+    pub loki: LokiConfig,
+    #[serde(default)]
     pub display: DisplayConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -15,6 +17,32 @@ pub struct Config {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct PrometheusConfig {
     pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LokiConfig {
+    #[serde(default = "default_loki_base_url")]
+    pub base_url: Option<String>,
+    #[serde(default = "default_loki_host_label")]
+    pub host_label: String,
+    #[serde(default = "default_loki_log_label")]
+    pub log_label: String,
+    #[serde(default = "default_loki_poll_secs")]
+    pub poll_secs: u64,
+    #[serde(default = "default_loki_lookback_secs")]
+    pub lookback_secs: u64,
+}
+
+impl Default for LokiConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_loki_base_url(),
+            host_label: default_loki_host_label(),
+            log_label: default_loki_log_label(),
+            poll_secs: default_loki_poll_secs(),
+            lookback_secs: default_loki_lookback_secs(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -47,6 +75,26 @@ fn default_log_path() -> String {
 
 fn default_log_level() -> String {
     String::from("info")
+}
+
+fn default_loki_host_label() -> String {
+    String::from("host")
+}
+
+fn default_loki_base_url() -> Option<String> {
+    Some(String::from("http://127.0.0.1:3100"))
+}
+
+fn default_loki_log_label() -> String {
+    String::from("job")
+}
+
+fn default_loki_poll_secs() -> u64 {
+    1
+}
+
+fn default_loki_lookback_secs() -> u64 {
+    300
 }
 
 impl Config {
@@ -83,6 +131,26 @@ mod tests {
     }
 
     #[test]
+    fn applies_loki_defaults_when_section_is_missing() {
+        let config: Config = toml::from_str(
+            r#"
+            [display]
+            refresh_secs = 10
+            "#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.loki.base_url.as_deref(),
+            Some("http://127.0.0.1:3100")
+        );
+        assert_eq!(config.loki.host_label, "host");
+        assert_eq!(config.loki.log_label, "job");
+        assert_eq!(config.loki.poll_secs, 1);
+        assert_eq!(config.loki.lookback_secs, 300);
+    }
+
+    #[test]
     fn parses_logging_configuration() {
         let config: Config = toml::from_str(
             r#"
@@ -95,6 +163,30 @@ mod tests {
 
         assert_eq!(config.logging.path, "logs/cranberry-dev.log");
         assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn parses_loki_configuration() {
+        let config: Config = toml::from_str(
+            r#"
+            [loki]
+            base_url = "http://127.0.0.1:3100"
+            host_label = "instance"
+            log_label = "container"
+            poll_secs = 2
+            lookback_secs = 120
+            "#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.loki.base_url.as_deref(),
+            Some("http://127.0.0.1:3100")
+        );
+        assert_eq!(config.loki.host_label, "instance");
+        assert_eq!(config.loki.log_label, "container");
+        assert_eq!(config.loki.poll_secs, 2);
+        assert_eq!(config.loki.lookback_secs, 120);
     }
 
     #[test]

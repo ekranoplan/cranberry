@@ -1,3 +1,4 @@
+use chrono::{Local, TimeZone};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -10,11 +11,16 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, HistoryView},
+    app::{App, HistoryView, LogFocus, ScreenMode},
     prometheus::MetricSample,
 };
 
 pub fn render(frame: &mut Frame, app: &App) {
+    if app.screen == ScreenMode::Logs {
+        render_logs_screen(frame, app);
+        return;
+    }
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -112,7 +118,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_history(frame, app, detail_layout[1]);
 
     let footer = Paragraph::new(
-        "q quit | j/k move | Space toggle select | c clear select | h history view | t target picker | / filter | r reload now",
+        "q quit | j/k move | Space toggle select | c clear select | h history view | t target picker | l logs | / filter | r reload now",
     )
     .block(Block::default().borders(Borders::ALL).title("Help"));
     frame.render_widget(footer, vertical[2]);
@@ -122,6 +128,94 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else if app.filter_input_open {
         render_filter_input(frame, app);
     }
+}
+
+fn render_logs_screen(frame: &mut Frame, app: &App) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Cranberry Logs",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  host label: "),
+        Span::styled(
+            app.selected_log_host().unwrap_or("-"),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw("  log label: "),
+        Span::styled(
+            app.selected_log_name().unwrap_or("-"),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  poll: "),
+        Span::styled(
+            format!("{}s", app.log_poll_secs()),
+            Style::default().fg(Color::Blue),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("Logs"));
+    frame.render_widget(header, vertical[0]);
+
+    let pickers = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(vertical[1]);
+    render_string_list(
+        frame,
+        pickers[0],
+        "Hosts",
+        &app.log_hosts,
+        app.log_host_selected,
+        app.log_focus == LogFocus::Hosts,
+    );
+    render_string_list(
+        frame,
+        pickers[1],
+        "Logs",
+        &app.log_names,
+        app.log_name_selected,
+        app.log_focus == LogFocus::Logs,
+    );
+
+    let visible = vertical[2].height.saturating_sub(2) as usize;
+    let start = app.log_entries.len().saturating_sub(visible.max(1));
+    let lines: Vec<Line> = app
+        .log_entries
+        .iter()
+        .skip(start)
+        .map(|entry| {
+            let timestamp = format_log_timestamp(entry.timestamp_ns);
+            Line::from(vec![
+                Span::styled(timestamp, Style::default().fg(Color::Blue)),
+                Span::raw(" "),
+                Span::raw(entry.line.as_str()),
+            ])
+        })
+        .collect();
+    let log_body = if lines.is_empty() {
+        Paragraph::new("no log lines yet")
+    } else {
+        Paragraph::new(lines)
+    }
+    .block(Block::default().borders(Borders::ALL).title("Tail"));
+    frame.render_widget(log_body, vertical[2]);
+
+    let footer = Paragraph::new(
+        "Esc back | Tab/h/l switch picker | j/k move | r reload labels/logs | q quit",
+    )
+    .block(Block::default().borders(Borders::ALL).title("Help"));
+    frame.render_widget(footer, vertical[3]);
 }
 
 fn render_target_picker(frame: &mut Frame, app: &App) {
@@ -394,6 +488,38 @@ where
             ListItem::new(format!("{prefix}{}", render_item(item)))
         })
         .collect()
+}
+
+fn render_string_list(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: &[String],
+    selected: usize,
+    focused: bool,
+) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let start = window_start(selected, items.len(), visible);
+    let rendered = visible_list_items(items, start, visible, selected, |item| item.clone());
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let list = List::new(rendered).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(title),
+    );
+    frame.render_widget(list, area);
+}
+
+fn format_log_timestamp(timestamp_ns: i64) -> String {
+    Local
+        .timestamp_nanos(timestamp_ns)
+        .format("%H:%M:%S%.3f")
+        .to_string()
 }
 
 fn format_metric_details(metric: &MetricSample) -> String {

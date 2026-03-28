@@ -1,6 +1,13 @@
 [prometheus]
 base_url = "http://127.0.0.1:9090"
 
+[loki]
+base_url = "http://127.0.0.1:3100"
+host_label = "host"
+log_label = "job"
+poll_secs = 1
+lookback_secs = 300
+
 [display]
 initial_metric = "up"
 refresh_secs = 15

@@ -1,5 +1,6 @@
 use crate::{
-    config::{DisplayConfig, PrometheusConfig},
+    config::{DisplayConfig, LokiConfig, PrometheusConfig},
+    loki::{LogEntry, LokiClient},
     prometheus::{parse_metrics, MetricSample},
 };
 use serde::Deserialize;
@@ -21,17 +22,40 @@ pub struct App {
     pub target_picker_open: bool,
     pub target_cursor: usize,
     pub history_view: HistoryView,
+    pub screen: ScreenMode,
+    pub log_focus: LogFocus,
+    pub log_hosts: Vec<String>,
+    pub log_host_selected: usize,
+    pub log_names: Vec<String>,
+    pub log_name_selected: usize,
+    pub log_entries: Vec<LogEntry>,
     source: DataSource,
+    loki: Option<LokiClient>,
+    loki_poll_secs: u64,
+    last_log_timestamp_ns: Option<i64>,
     display: DisplayConfig,
     all_metrics: Vec<MetricSample>,
     metric_history: BTreeMap<MetricKey, VecDeque<f64>>,
     selected_metrics: BTreeSet<MetricKey>,
+    target_notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryView {
     Graph,
     Table,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenMode {
+    Metrics,
+    Logs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogFocus {
+    Hosts,
+    Logs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,9 +73,32 @@ enum DataSource {
     },
 }
 
+#[derive(Clone, Debug)]
+struct TargetStateSnapshot {
+    selected: Option<TargetFilter>,
+    cursor: Option<TargetFilter>,
+}
+
+#[derive(Debug, Default)]
+struct TargetStateRestore {
+    selected_missing: bool,
+    cursor_missing: bool,
+}
+
 impl App {
+    #[cfg(test)]
     pub fn new(prometheus: PrometheusConfig, display: DisplayConfig) -> Self {
+        Self::with_loki(prometheus, LokiConfig::default(), display)
+    }
+
+    pub fn with_loki(
+        prometheus: PrometheusConfig,
+        loki: LokiConfig,
+        display: DisplayConfig,
+    ) -> Self {
         let source = build_source(prometheus);
+        let loki_poll_secs = loki.poll_secs.max(1);
+        let loki = LokiClient::new(loki);
         let refresh_secs = display.refresh_secs.unwrap_or(15);
 
         let mut app = Self {
@@ -66,11 +113,22 @@ impl App {
             target_picker_open: false,
             target_cursor: 0,
             history_view: HistoryView::Graph,
+            screen: ScreenMode::Metrics,
+            log_focus: LogFocus::Hosts,
+            log_hosts: Vec::new(),
+            log_host_selected: 0,
+            log_names: Vec::new(),
+            log_name_selected: 0,
+            log_entries: Vec::new(),
             source,
+            loki,
+            loki_poll_secs,
+            last_log_timestamp_ns: None,
             display,
             all_metrics: Vec::new(),
             metric_history: BTreeMap::new(),
             selected_metrics: BTreeSet::new(),
+            target_notice: None,
         };
         info!(refresh_secs, "app initialized");
         app.reload();
@@ -151,6 +209,26 @@ impl App {
 
     pub fn refresh_secs(&self) -> u64 {
         self.display.refresh_secs.unwrap_or(15)
+    }
+
+    pub fn log_poll_secs(&self) -> u64 {
+        self.loki_poll_secs
+    }
+
+    pub fn is_logs_screen(&self) -> bool {
+        self.screen == ScreenMode::Logs
+    }
+
+    pub fn selected_log_host(&self) -> Option<&str> {
+        self.log_hosts
+            .get(self.log_host_selected)
+            .map(String::as_str)
+    }
+
+    pub fn selected_log_name(&self) -> Option<&str> {
+        self.log_names
+            .get(self.log_name_selected)
+            .map(String::as_str)
     }
 
     pub fn toggle_history_view(&mut self) {
@@ -236,6 +314,142 @@ impl App {
         self.apply_target_selection();
     }
 
+    pub fn open_logs(&mut self) {
+        if self.loki.is_none() {
+            self.status = String::from("loki is not configured");
+            return;
+        }
+        self.filter_input_open = false;
+        self.target_picker_open = false;
+        self.screen = ScreenMode::Logs;
+        self.log_entries.clear();
+        self.last_log_timestamp_ns = None;
+        self.status = String::from("loading loki labels");
+        self.refresh_log_options();
+        self.refresh_logs();
+    }
+
+    pub fn close_logs(&mut self) {
+        self.screen = ScreenMode::Metrics;
+        self.update_loaded_status();
+    }
+
+    pub fn toggle_log_focus(&mut self) {
+        self.log_focus = match self.log_focus {
+            LogFocus::Hosts => LogFocus::Logs,
+            LogFocus::Logs => LogFocus::Hosts,
+        };
+        self.status = format!("log picker focus: {}", self.log_focus.label());
+    }
+
+    pub fn next_log_option(&mut self) {
+        match self.log_focus {
+            LogFocus::Hosts => {
+                if let Some(next) = wrapping_next(self.log_host_selected, self.log_hosts.len()) {
+                    self.log_host_selected = next;
+                    self.last_log_timestamp_ns = None;
+                    self.log_entries.clear();
+                    self.refresh_logs();
+                }
+            }
+            LogFocus::Logs => {
+                if let Some(next) = wrapping_next(self.log_name_selected, self.log_names.len()) {
+                    self.log_name_selected = next;
+                    self.last_log_timestamp_ns = None;
+                    self.log_entries.clear();
+                    self.refresh_logs();
+                }
+            }
+        }
+    }
+
+    pub fn previous_log_option(&mut self) {
+        match self.log_focus {
+            LogFocus::Hosts => {
+                if let Some(prev) = wrapping_prev(self.log_host_selected, self.log_hosts.len()) {
+                    self.log_host_selected = prev;
+                    self.last_log_timestamp_ns = None;
+                    self.log_entries.clear();
+                    self.refresh_logs();
+                }
+            }
+            LogFocus::Logs => {
+                if let Some(prev) = wrapping_prev(self.log_name_selected, self.log_names.len()) {
+                    self.log_name_selected = prev;
+                    self.last_log_timestamp_ns = None;
+                    self.log_entries.clear();
+                    self.refresh_logs();
+                }
+            }
+        }
+    }
+
+    pub fn refresh_logs(&mut self) {
+        let Some(loki) = &self.loki else {
+            self.status = String::from("loki is not configured");
+            return;
+        };
+        let host = self.selected_log_host().map(str::to_owned);
+        let log_name = self.selected_log_name().map(str::to_owned);
+        let (Some(host), Some(log_name)) = (host, log_name) else {
+            self.status = String::from("no loki host/log labels available");
+            return;
+        };
+
+        match loki.poll_logs(&host, &log_name, self.last_log_timestamp_ns) {
+            Ok(entries) => {
+                if let Some(last) = entries.last() {
+                    self.last_log_timestamp_ns = Some(last.timestamp_ns);
+                }
+                self.log_entries.extend(entries);
+                if self.log_entries.len() > 500 {
+                    let drop_len = self.log_entries.len() - 500;
+                    self.log_entries.drain(0..drop_len);
+                }
+                self.status = format!("streaming logs for {host} / {log_name}");
+            }
+            Err(err) => {
+                self.status = format!("loki log fetch error: {err}");
+            }
+        }
+    }
+
+    pub fn reload_logs_screen(&mut self) {
+        self.refresh_log_options();
+        self.refresh_logs();
+    }
+
+    fn refresh_log_options(&mut self) {
+        let Some(loki) = &self.loki else {
+            return;
+        };
+
+        match loki.fetch_hosts() {
+            Ok(hosts) => {
+                self.log_hosts = hosts;
+                if self.log_host_selected >= self.log_hosts.len() {
+                    self.log_host_selected = 0;
+                }
+            }
+            Err(err) => {
+                self.status = format!("loki host labels error: {err}");
+                return;
+            }
+        }
+
+        match loki.fetch_logs() {
+            Ok(log_names) => {
+                self.log_names = log_names;
+                if self.log_name_selected >= self.log_names.len() {
+                    self.log_name_selected = 0;
+                }
+            }
+            Err(err) => {
+                self.status = format!("loki log labels error: {err}");
+            }
+        }
+    }
+
     pub fn reload(&mut self) {
         info!(source = %self.data_source_label(), "starting reload");
         match &self.source {
@@ -273,21 +487,14 @@ impl App {
         base_url: &str,
         client: &reqwest::blocking::Client,
     ) -> Result<(), String> {
-        let previous = self.target_options.get(self.target_selected).cloned();
+        let previous = self.capture_target_state();
         info!(%base_url, "fetching targets from prometheus");
         let targets = fetch_targets(base_url, client)?;
         info!(%base_url, targets = targets.len(), "fetched targets from prometheus");
         self.target_options = targets;
-        self.restore_target_selection(previous);
-        self.target_picker_open = false;
+        let restore = self.restore_target_state(previous);
+        self.apply_target_restore(restore);
         self.load_selected_target_metrics(base_url, client)
-    }
-
-    fn restore_target_selection(&mut self, previous: Option<TargetFilter>) {
-        self.target_selected = previous
-            .and_then(|current| self.target_options.iter().position(|item| item == &current))
-            .unwrap_or(0);
-        self.target_cursor = self.target_selected;
     }
 
     fn set_metrics(&mut self, metrics: Vec<MetricSample>) {
@@ -315,6 +522,7 @@ impl App {
         self.target_picker_open = false;
         self.cursor = 0;
         self.selected_metrics.clear();
+        self.target_notice = None;
         self.status = status;
     }
 
@@ -356,7 +564,7 @@ impl App {
     }
 
     fn refresh_target_options(&mut self) {
-        let previous = self.target_options.get(self.target_selected).cloned();
+        let previous = self.capture_target_state();
         let filters = self.all_metrics.iter().filter_map(|metric| {
             let job = label_value(metric, "job")?.to_owned();
             let target = label_value(metric, "instance")
@@ -366,7 +574,8 @@ impl App {
             Some(TargetFilter { job, target })
         });
         self.target_options = build_target_options(filters);
-        self.restore_target_selection(previous);
+        let restore = self.restore_target_state(previous);
+        self.apply_target_restore(restore);
     }
 
     fn rebuild_metrics_view(&mut self, previous_selection: Option<&MetricKey>) {
@@ -471,11 +680,73 @@ impl App {
     }
 
     fn update_loaded_status(&mut self) {
-        self.status = format!(
+        let mut status = format!(
             "loaded {} metrics for {}",
             self.metrics.len(),
             self.selected_target()
         );
+        if let Some(notice) = self.target_notice.take() {
+            status.push_str(" (");
+            status.push_str(&notice);
+            status.push(')');
+        }
+        self.status = status;
+    }
+
+    fn capture_target_state(&self) -> TargetStateSnapshot {
+        TargetStateSnapshot {
+            selected: self.target_options.get(self.target_selected).cloned(),
+            cursor: self
+                .target_picker_open
+                .then(|| self.target_options.get(self.target_cursor).cloned())
+                .flatten(),
+        }
+    }
+
+    fn restore_target_state(&mut self, previous: TargetStateSnapshot) -> TargetStateRestore {
+        let mut result = TargetStateRestore::default();
+
+        self.target_selected = match previous.selected {
+            Some(current) => match self.target_options.iter().position(|item| item == &current) {
+                Some(index) => index,
+                None => {
+                    result.selected_missing = true;
+                    0
+                }
+            },
+            None => 0,
+        };
+
+        self.target_cursor = match previous.cursor {
+            Some(current) => match self.target_options.iter().position(|item| item == &current) {
+                Some(index) => index,
+                None => {
+                    result.cursor_missing = true;
+                    self.target_selected
+                }
+            },
+            None => self.target_selected,
+        };
+
+        result
+    }
+
+    fn apply_target_restore(&mut self, restore: TargetStateRestore) {
+        self.target_notice = if restore.selected_missing && restore.cursor_missing {
+            Some(String::from(
+                "previous target selection and picker cursor are no longer available",
+            ))
+        } else if restore.selected_missing {
+            Some(String::from(
+                "previous target selection is no longer available",
+            ))
+        } else if restore.cursor_missing {
+            Some(String::from(
+                "previous picker cursor target is no longer available",
+            ))
+        } else {
+            None
+        };
     }
 
     fn run_prometheus_reload<F>(
@@ -519,6 +790,15 @@ impl HistoryView {
         match self {
             HistoryView::Graph => "graph",
             HistoryView::Table => "table",
+        }
+    }
+}
+
+impl LogFocus {
+    pub fn label(self) -> &'static str {
+        match self {
+            LogFocus::Hosts => "hosts",
+            LogFocus::Logs => "logs",
         }
     }
 }
@@ -848,6 +1128,59 @@ mod tests {
         assert!(!app.target_picker_open);
         assert_eq!(app.selected_target().target, "b:9090");
         assert_eq!(app.metrics.len(), 1);
+    }
+
+    #[test]
+    fn keeps_target_picker_open_and_cursor_position_after_reload() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\nup{job=\"api\",instance=\"b:9090\"} 1\n",
+        );
+        app.open_target_picker();
+        app.picker_next();
+        app.picker_next();
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 2\nup{job=\"api\",instance=\"b:9090\"} 2\n",
+        );
+
+        assert!(app.target_picker_open);
+        assert_eq!(app.selected_target(), &TargetFilter::wildcard());
+        assert_eq!(app.target_options[app.target_cursor].target, "b:9090");
+    }
+
+    #[test]
+    fn falls_back_when_picker_cursor_target_disappears_after_reload() {
+        let mut app = App::new(
+            PrometheusConfig::default(),
+            DisplayConfig {
+                max_metrics: None,
+                initial_metric: None,
+                refresh_secs: None,
+            },
+        );
+
+        app.reload_from_str(
+            "up{job=\"api\",instance=\"a:9090\"} 1\nup{job=\"api\",instance=\"b:9090\"} 1\n",
+        );
+        app.open_target_picker();
+        app.picker_next();
+        app.picker_next();
+
+        app.reload_from_str("up{job=\"api\",instance=\"a:9090\"} 2\n");
+
+        assert!(app.target_picker_open);
+        assert_eq!(app.selected_target(), &TargetFilter::wildcard());
+        assert_eq!(app.target_cursor, app.target_selected);
+        assert_eq!(app.status, "loaded 1 metrics for all targets (previous picker cursor target is no longer available)");
     }
 
     #[test]
