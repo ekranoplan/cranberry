@@ -1,5 +1,7 @@
 # Cranberry
 
+[![CI](https://github.com/ekranoplan/cranberry/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ekranoplan/cranberry/actions/workflows/ci.yml)
+
 Cranberry is a Rust TUI dashboard for browsing metrics from Prometheus through the Prometheus HTTP API.
 It can also stream logs from Loki in a dedicated screen.
 
