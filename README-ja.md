@@ -1,6 +1,7 @@
 # Cranberry
 
 Cranberry は、Prometheus HTTP API 経由で Prometheus のメトリクスを参照するための Rust 製 TUI ダッシュボードです。
+Loki のログを別画面で追いかけることもできます。
 
 ## 実行
 
@@ -30,6 +31,13 @@ cargo run -- --config /path/to/cranberry.toml
 [prometheus]
 base_url = "http://127.0.0.1:9090"
 
+[loki]
+base_url = "http://127.0.0.1:3100"
+host_label = "host"
+log_label = "job"
+poll_secs = 1
+lookback_secs = 300
+
 [display]
 max_metrics = 20
 initial_metric = "up"
@@ -46,6 +54,11 @@ level = "info"
 - `display.max_metrics`: ターゲットとテキストフィルタ適用後に表示するメトリクス数の上限
 - `display.initial_metric`: 起動時に最初に選択するメトリクス名
 - `display.refresh_secs`: 自動更新間隔（秒）
+- `loki.base_url`: Loki サーバーの base URL。デフォルトは `http://127.0.0.1:3100`
+- `loki.host_label`: ホスト選択に使うラベル名。デフォルトは `host`
+- `loki.log_label`: ログ種別選択に使うラベル名。デフォルトは `job`
+- `loki.poll_secs`: ログ更新のポーリング間隔（秒）。デフォルトは `1`
+- `loki.lookback_secs`: ログ画面を開いたときの初期取得範囲（秒）。デフォルトは `300`
 - `logging.path`: ログファイルのパス。デフォルトは `cranberry.log`
 - `logging.level`: ログレベル。`trace`、`debug`、`info`、`warn`、`error` のいずれか。デフォルトは `info`
 
@@ -57,9 +70,11 @@ level = "info"
 - `j` / `k`: 選択を移動
 - `[` / `]`: ターゲットを切り替え
 - `t`: ターゲットピッカーを開く
+- `l`: Loki ログビューアを開く
 - `/`: メトリクスフィルタ入力を開く
 - `r`: 即時リロード
-- `Esc`: ターゲットピッカーまたはフィルタ入力を閉じる
+- ログ画面で `Tab` / `h` / `l`: ホスト一覧とログ一覧のフォーカスを切り替え
+- `Esc`: ターゲットピッカー、フィルタ入力、ログ画面を閉じる
 - `Enter`: ターゲットピッカーの選択を適用、またはフィルタ入力を閉じる
 - `Backspace`: フィルタ入力で 1 文字削除
 - `Ctrl-U`: フィルタ入力をクリア
