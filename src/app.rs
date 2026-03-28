@@ -136,15 +136,11 @@ impl App {
     }
 
     pub fn next(&mut self) {
-        if let Some(next) = wrapping_next(self.cursor, self.metrics.len()) {
-            self.cursor = next;
-        }
+        let _ = advance_wrapped_index(&mut self.cursor, self.metrics.len(), 1);
     }
 
     pub fn previous(&mut self) {
-        if let Some(prev) = wrapping_prev(self.cursor, self.metrics.len()) {
-            self.cursor = prev;
-        }
+        let _ = advance_wrapped_index(&mut self.cursor, self.metrics.len(), -1);
     }
 
     pub fn selected_metric(&self) -> Option<&MetricSample> {
@@ -186,8 +182,7 @@ impl App {
     }
 
     pub fn next_target(&mut self) {
-        if let Some(next) = wrapping_next(self.target_selected, self.target_options.len()) {
-            self.target_selected = next;
+        if advance_wrapped_index(&mut self.target_selected, self.target_options.len(), 1) {
             self.target_cursor = self.target_selected;
             info!(target = %self.selected_target(), "selected next target");
             self.apply_target_selection();
@@ -195,8 +190,7 @@ impl App {
     }
 
     pub fn previous_target(&mut self) {
-        if let Some(prev) = wrapping_prev(self.target_selected, self.target_options.len()) {
-            self.target_selected = prev;
+        if advance_wrapped_index(&mut self.target_selected, self.target_options.len(), -1) {
             self.target_cursor = self.target_selected;
             info!(target = %self.selected_target(), "selected previous target");
             self.apply_target_selection();
@@ -293,15 +287,11 @@ impl App {
     }
 
     pub fn picker_next(&mut self) {
-        if let Some(next) = wrapping_next(self.target_cursor, self.target_options.len()) {
-            self.target_cursor = next;
-        }
+        let _ = advance_wrapped_index(&mut self.target_cursor, self.target_options.len(), 1);
     }
 
     pub fn picker_previous(&mut self) {
-        if let Some(prev) = wrapping_prev(self.target_cursor, self.target_options.len()) {
-            self.target_cursor = prev;
-        }
+        let _ = advance_wrapped_index(&mut self.target_cursor, self.target_options.len(), -1);
     }
 
     pub fn picker_apply(&mut self) {
@@ -322,8 +312,7 @@ impl App {
         self.filter_input_open = false;
         self.target_picker_open = false;
         self.screen = ScreenMode::Logs;
-        self.log_entries.clear();
-        self.last_log_timestamp_ns = None;
+        self.reset_log_stream();
         self.status = String::from("loading loki labels");
         self.refresh_log_options();
         self.refresh_logs();
@@ -343,45 +332,11 @@ impl App {
     }
 
     pub fn next_log_option(&mut self) {
-        match self.log_focus {
-            LogFocus::Hosts => {
-                if let Some(next) = wrapping_next(self.log_host_selected, self.log_hosts.len()) {
-                    self.log_host_selected = next;
-                    self.last_log_timestamp_ns = None;
-                    self.log_entries.clear();
-                    self.refresh_logs();
-                }
-            }
-            LogFocus::Logs => {
-                if let Some(next) = wrapping_next(self.log_name_selected, self.log_names.len()) {
-                    self.log_name_selected = next;
-                    self.last_log_timestamp_ns = None;
-                    self.log_entries.clear();
-                    self.refresh_logs();
-                }
-            }
-        }
+        self.advance_log_option(1);
     }
 
     pub fn previous_log_option(&mut self) {
-        match self.log_focus {
-            LogFocus::Hosts => {
-                if let Some(prev) = wrapping_prev(self.log_host_selected, self.log_hosts.len()) {
-                    self.log_host_selected = prev;
-                    self.last_log_timestamp_ns = None;
-                    self.log_entries.clear();
-                    self.refresh_logs();
-                }
-            }
-            LogFocus::Logs => {
-                if let Some(prev) = wrapping_prev(self.log_name_selected, self.log_names.len()) {
-                    self.log_name_selected = prev;
-                    self.last_log_timestamp_ns = None;
-                    self.log_entries.clear();
-                    self.refresh_logs();
-                }
-            }
-        }
+        self.advance_log_option(-1);
     }
 
     pub fn refresh_logs(&mut self) {
@@ -417,6 +372,28 @@ impl App {
     pub fn reload_logs_screen(&mut self) {
         self.refresh_log_options();
         self.refresh_logs();
+    }
+
+    fn advance_log_option(&mut self, step: isize) {
+        match self.log_focus {
+            LogFocus::Hosts => {
+                if advance_wrapped_index(&mut self.log_host_selected, self.log_hosts.len(), step) {
+                    self.reset_log_stream();
+                    self.refresh_logs();
+                }
+            }
+            LogFocus::Logs => {
+                if advance_wrapped_index(&mut self.log_name_selected, self.log_names.len(), step) {
+                    self.reset_log_stream();
+                    self.refresh_logs();
+                }
+            }
+        }
+    }
+
+    fn reset_log_stream(&mut self) {
+        self.last_log_timestamp_ns = None;
+        self.log_entries.clear();
     }
 
     fn refresh_log_options(&mut self) {
@@ -813,22 +790,15 @@ http_requests_total{method="GET",code="200"} 128
 http_requests_total{method="GET",code="500"} 3
 "#;
 
-fn wrapping_next(index: usize, len: usize) -> Option<usize> {
+fn advance_wrapped_index(index: &mut usize, len: usize, step: isize) -> bool {
     if len == 0 {
-        None
-    } else {
-        Some((index + 1) % len)
+        return false;
     }
-}
 
-fn wrapping_prev(index: usize, len: usize) -> Option<usize> {
-    if len == 0 {
-        None
-    } else if index == 0 {
-        Some(len - 1)
-    } else {
-        Some(index - 1)
-    }
+    let len = len as isize;
+    let next = ((*index as isize) + step).rem_euclid(len) as usize;
+    *index = next;
+    true
 }
 
 fn build_source(prometheus: PrometheusConfig) -> DataSource {
