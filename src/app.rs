@@ -9,6 +9,7 @@ use std::fmt;
 use tracing::{error, info, warn};
 
 const HISTORY_LIMIT: usize = 60;
+const LOG_ENTRY_LIMIT: usize = 3000;
 
 pub struct App {
     pub metrics: Vec<MetricSample>,
@@ -401,8 +402,8 @@ impl App {
                     self.last_log_timestamp_ns = Some(last.timestamp_ns);
                 }
                 self.log_entries.extend(entries);
-                if self.log_entries.len() > 500 {
-                    let drop_len = self.log_entries.len() - 500;
+                if self.log_entries.len() > LOG_ENTRY_LIMIT {
+                    let drop_len = self.log_entries.len() - LOG_ENTRY_LIMIT;
                     self.log_entries.drain(0..drop_len);
                 }
                 self.update_log_status();

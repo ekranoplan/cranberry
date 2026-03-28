@@ -42,7 +42,7 @@ base_url = "http://127.0.0.1:3100"
 host_label = "host"
 log_label = "job"
 poll_secs = 1
-lookback_secs = 300
+lookback_secs = 1200
 
 [display]
 max_metrics = 20
@@ -64,7 +64,7 @@ Supported options:
 - `loki.host_label`: Label name used for host selection. Defaults to `host`
 - `loki.log_label`: Label name used for log selection. Defaults to `job`
 - `loki.poll_secs`: Poll interval for log updates in seconds. Defaults to `1`
-- `loki.lookback_secs`: Initial log lookback window in seconds. Defaults to `300`
+- `loki.lookback_secs`: Initial log lookback window in seconds. Defaults to `1200`
 - `logging.path`: Log file path. Defaults to `cranberry.log`
 - `logging.level`: Log verbosity. One of `trace`, `debug`, `info`, `warn`, `error`. Defaults to `info`
 

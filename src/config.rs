@@ -94,7 +94,7 @@ fn default_loki_poll_secs() -> u64 {
 }
 
 fn default_loki_lookback_secs() -> u64 {
-    300
+    1200
 }
 
 impl Config {
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(config.loki.host_label, "host");
         assert_eq!(config.loki.log_label, "job");
         assert_eq!(config.loki.poll_secs, 1);
-        assert_eq!(config.loki.lookback_secs, 300);
+        assert_eq!(config.loki.lookback_secs, 1200);
     }
 
     #[test]

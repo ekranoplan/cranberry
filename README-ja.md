@@ -36,7 +36,7 @@ base_url = "http://127.0.0.1:3100"
 host_label = "host"
 log_label = "job"
 poll_secs = 1
-lookback_secs = 300
+lookback_secs = 1200
 
 [display]
 max_metrics = 20
@@ -58,7 +58,7 @@ level = "info"
 - `loki.host_label`: ホスト選択に使うラベル名。デフォルトは `host`
 - `loki.log_label`: ログ種別選択に使うラベル名。デフォルトは `job`
 - `loki.poll_secs`: ログ更新のポーリング間隔（秒）。デフォルトは `1`
-- `loki.lookback_secs`: ログ画面を開いたときの初期取得範囲（秒）。デフォルトは `300`
+- `loki.lookback_secs`: ログ画面を開いたときの初期取得範囲（秒）。デフォルトは `1200`
 - `logging.path`: ログファイルのパス。デフォルトは `cranberry.log`
 - `logging.level`: ログレベル。`trace`、`debug`、`info`、`warn`、`error` のいずれか。デフォルトは `info`
 
