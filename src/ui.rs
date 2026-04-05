@@ -199,10 +199,15 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
 
     let filtered_entries = app.visible_log_entries();
     let visible = vertical[2].height.saturating_sub(2) as usize;
-    let start = filtered_entries.len().saturating_sub(visible.max(1));
+    let start = tail_window_start(
+        filtered_entries.len(),
+        visible.max(1),
+        app.log_tail_scroll_offset(),
+    );
     let lines: Vec<Line> = filtered_entries
         .iter()
         .skip(start)
+        .take(visible.max(1))
         .map(|entry| {
             let timestamp = format_log_timestamp(entry.timestamp_ns);
             Line::from(vec![
@@ -221,11 +226,20 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
     } else {
         Paragraph::new(lines)
     }
-    .block(Block::default().borders(Borders::ALL).title("Tail"));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.log_focus == LogFocus::Tail {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            })
+            .title("Tail"),
+    );
     frame.render_widget(log_body, vertical[2]);
 
     let footer = Paragraph::new(
-        "Esc back | Tab/h/l switch picker | j/k move | / filter | r reload labels/logs | q quit",
+        "Esc back | Tab/Shift-Tab or h/l switch pane | j/k move or scroll | PgUp/PgDn/Home/End tail | / filter | r reload labels/logs | q quit",
     )
     .block(Block::default().borders(Borders::ALL).title("Help"));
     frame.render_widget(footer, vertical[3]);
@@ -492,6 +506,14 @@ fn window_start(selected: usize, len: usize, visible: usize) -> usize {
     selected
         .saturating_sub(visible.saturating_sub(1))
         .min(max_start)
+}
+
+fn tail_window_start(len: usize, visible: usize, offset: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+
+    len.saturating_sub(visible.saturating_add(offset))
 }
 
 fn visible_list_items<T, F>(

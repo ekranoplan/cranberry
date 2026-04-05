@@ -11,6 +11,15 @@ use tracing::{error, info, warn};
 const HISTORY_LIMIT: usize = 60;
 const LOG_ENTRY_LIMIT: usize = 3000;
 
+type LogStreamKey = (String, String);
+
+#[derive(Clone, Debug, Default)]
+struct LogStreamState {
+    entries: Vec<LogEntry>,
+    last_timestamp_ns: Option<i64>,
+    tail_offset: usize,
+}
+
 pub struct App {
     pub metrics: Vec<MetricSample>,
     pub cursor: usize,
@@ -35,6 +44,8 @@ pub struct App {
     source: DataSource,
     loki: Option<LokiClient>,
     loki_poll_secs: u64,
+    log_streams: BTreeMap<LogStreamKey, LogStreamState>,
+    log_tail_offset: usize,
     last_log_timestamp_ns: Option<i64>,
     display: DisplayConfig,
     all_metrics: Vec<MetricSample>,
@@ -59,6 +70,7 @@ pub enum ScreenMode {
 pub enum LogFocus {
     Hosts,
     Logs,
+    Tail,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +140,8 @@ impl App {
             source,
             loki,
             loki_poll_secs,
+            log_streams: BTreeMap::new(),
+            log_tail_offset: 0,
             last_log_timestamp_ns: None,
             display,
             all_metrics: Vec::new(),
@@ -326,9 +340,9 @@ impl App {
         self.log_filter_input_open = false;
         self.target_picker_open = false;
         self.screen = ScreenMode::Logs;
-        self.reset_log_stream();
         self.status = String::from("loading loki labels");
         self.refresh_log_options();
+        self.restore_current_log_stream();
         self.refresh_logs();
     }
 
@@ -338,12 +352,22 @@ impl App {
         self.update_loaded_status();
     }
 
-    pub fn toggle_log_focus(&mut self) {
+    pub fn next_log_focus(&mut self) {
         self.log_focus = match self.log_focus {
             LogFocus::Hosts => LogFocus::Logs,
-            LogFocus::Logs => LogFocus::Hosts,
+            LogFocus::Logs => LogFocus::Tail,
+            LogFocus::Tail => LogFocus::Hosts,
         };
-        self.status = format!("log picker focus: {}", self.log_focus.label());
+        self.status = format!("log pane focus: {}", self.log_focus.label());
+    }
+
+    pub fn previous_log_focus(&mut self) {
+        self.log_focus = match self.log_focus {
+            LogFocus::Hosts => LogFocus::Tail,
+            LogFocus::Logs => LogFocus::Hosts,
+            LogFocus::Tail => LogFocus::Logs,
+        };
+        self.status = format!("log pane focus: {}", self.log_focus.label());
     }
 
     pub fn next_log_option(&mut self) {
@@ -368,20 +392,51 @@ impl App {
 
     pub fn push_log_filter_char(&mut self, ch: char) {
         self.log_filter_query.push(ch);
+        self.clamp_log_tail_offset();
+        self.store_current_log_stream();
         self.status = format!("filter logs: {}", self.log_filter_query);
         info!(filter = %self.log_filter_query, added = %ch, "updated log filter query");
     }
 
     pub fn pop_log_filter_char(&mut self) {
         self.log_filter_query.pop();
+        self.clamp_log_tail_offset();
+        self.store_current_log_stream();
         self.status = format!("filter logs: {}", self.log_filter_query);
         info!(filter = %self.log_filter_query, "deleted log filter character");
     }
 
     pub fn clear_log_filter(&mut self) {
         self.log_filter_query.clear();
+        self.clamp_log_tail_offset();
+        self.store_current_log_stream();
         self.status = String::from("log filter cleared");
         info!("cleared log filter query");
+    }
+
+    pub fn log_tail_scroll_offset(&self) -> usize {
+        self.log_tail_offset
+    }
+
+    pub fn scroll_log_tail_up(&mut self, step: usize) {
+        self.log_tail_offset = self.log_tail_offset.saturating_add(step);
+        self.clamp_log_tail_offset();
+        self.store_current_log_stream();
+    }
+
+    pub fn scroll_log_tail_down(&mut self, step: usize) {
+        self.log_tail_offset = self.log_tail_offset.saturating_sub(step);
+        self.store_current_log_stream();
+    }
+
+    pub fn scroll_log_tail_to_oldest(&mut self) {
+        self.log_tail_offset = self.max_log_tail_offset();
+        self.store_current_log_stream();
+    }
+
+    pub fn scroll_log_tail_to_latest(&mut self) {
+        self.log_tail_offset = 0;
+        self.store_current_log_stream();
     }
 
     pub fn refresh_logs(&mut self) {
@@ -397,17 +452,7 @@ impl App {
         };
 
         match loki.poll_logs(&host, &log_name, self.last_log_timestamp_ns) {
-            Ok(entries) => {
-                if let Some(last) = entries.last() {
-                    self.last_log_timestamp_ns = Some(last.timestamp_ns);
-                }
-                self.log_entries.extend(entries);
-                if self.log_entries.len() > LOG_ENTRY_LIMIT {
-                    let drop_len = self.log_entries.len() - LOG_ENTRY_LIMIT;
-                    self.log_entries.drain(0..drop_len);
-                }
-                self.update_log_status();
-            }
+            Ok(entries) => self.append_log_entries(entries),
             Err(err) => {
                 self.status = format!("loki log fetch error: {err}");
             }
@@ -416,6 +461,7 @@ impl App {
 
     pub fn reload_logs_screen(&mut self) {
         self.refresh_log_options();
+        self.restore_current_log_stream();
         self.refresh_logs();
     }
 
@@ -423,22 +469,100 @@ impl App {
         match self.log_focus {
             LogFocus::Hosts => {
                 if advance_wrapped_index(&mut self.log_host_selected, self.log_hosts.len(), step) {
-                    self.reset_log_stream();
+                    self.restore_current_log_stream();
                     self.refresh_logs();
                 }
             }
             LogFocus::Logs => {
                 if advance_wrapped_index(&mut self.log_name_selected, self.log_names.len(), step) {
-                    self.reset_log_stream();
+                    self.restore_current_log_stream();
                     self.refresh_logs();
                 }
             }
+            LogFocus::Tail => {}
         }
     }
 
-    fn reset_log_stream(&mut self) {
+    fn clear_current_log_stream(&mut self) {
         self.last_log_timestamp_ns = None;
         self.log_entries.clear();
+        self.log_tail_offset = 0;
+    }
+
+    fn current_log_stream_key(&self) -> Option<LogStreamKey> {
+        Some((
+            self.selected_log_host()?.to_owned(),
+            self.selected_log_name()?.to_owned(),
+        ))
+    }
+
+    fn restore_current_log_stream(&mut self) {
+        let Some(key) = self.current_log_stream_key() else {
+            self.clear_current_log_stream();
+            return;
+        };
+
+        if let Some(state) = self.log_streams.get(&key) {
+            self.last_log_timestamp_ns = state.last_timestamp_ns;
+            self.log_entries = state.entries.clone();
+            self.log_tail_offset = state.tail_offset;
+            self.clamp_log_tail_offset();
+        } else {
+            self.clear_current_log_stream();
+        }
+    }
+
+    fn store_current_log_stream(&mut self) {
+        let Some(key) = self.current_log_stream_key() else {
+            return;
+        };
+
+        self.log_streams.insert(
+            key,
+            LogStreamState {
+                entries: self.log_entries.clone(),
+                last_timestamp_ns: self.last_log_timestamp_ns,
+                tail_offset: self.log_tail_offset,
+            },
+        );
+    }
+
+    fn append_log_entries(&mut self, entries: Vec<LogEntry>) {
+        let needle = self.log_filter_query.to_lowercase();
+        let appended_visible = if self.log_tail_offset == 0 {
+            0
+        } else {
+            entries
+                .iter()
+                .filter(|entry| self.matches_log_filter_with(&needle, entry))
+                .count()
+        };
+
+        if let Some(last) = entries.last() {
+            self.last_log_timestamp_ns = Some(last.timestamp_ns);
+        }
+
+        self.log_entries.extend(entries);
+        if self.log_entries.len() > LOG_ENTRY_LIMIT {
+            let drop_len = self.log_entries.len() - LOG_ENTRY_LIMIT;
+            self.log_entries.drain(0..drop_len);
+        }
+
+        if appended_visible > 0 {
+            self.log_tail_offset = self.log_tail_offset.saturating_add(appended_visible);
+        }
+
+        self.clamp_log_tail_offset();
+        self.store_current_log_stream();
+        self.update_log_status();
+    }
+
+    fn clamp_log_tail_offset(&mut self) {
+        self.log_tail_offset = self.log_tail_offset.min(self.max_log_tail_offset());
+    }
+
+    fn max_log_tail_offset(&self) -> usize {
+        self.visible_log_entries().len().saturating_sub(1)
     }
 
     fn refresh_log_options(&mut self) {
@@ -837,6 +961,7 @@ impl LogFocus {
         match self {
             LogFocus::Hosts => "hosts",
             LogFocus::Logs => "logs",
+            LogFocus::Tail => "tail",
         }
     }
 }
@@ -1083,7 +1208,7 @@ fn metric_key(metric: &MetricSample) -> MetricKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, HistoryView, TargetFilter, HISTORY_LIMIT};
+    use super::{App, HistoryView, LogFocus, TargetFilter, HISTORY_LIMIT};
     use crate::config::{DisplayConfig, PrometheusConfig};
     use crate::loki::LogEntry;
 
@@ -1337,6 +1462,186 @@ mod tests {
         let visible = app.visible_log_entries();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].line, "tailscaled: upload failed 429");
+    }
+
+    #[test]
+    fn cycles_log_focus_across_tail_pane() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+
+        assert_eq!(app.log_focus, LogFocus::Hosts);
+
+        app.next_log_focus();
+        assert_eq!(app.log_focus, LogFocus::Logs);
+
+        app.next_log_focus();
+        assert_eq!(app.log_focus, LogFocus::Tail);
+
+        app.previous_log_focus();
+        assert_eq!(app.log_focus, LogFocus::Logs);
+    }
+
+    #[test]
+    fn scrolls_tail_offset_and_clamps_to_visible_logs() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.log_entries = vec![
+            LogEntry {
+                timestamp_ns: 1,
+                line: String::from("line 1"),
+            },
+            LogEntry {
+                timestamp_ns: 2,
+                line: String::from("line 2"),
+            },
+            LogEntry {
+                timestamp_ns: 3,
+                line: String::from("line 3"),
+            },
+        ];
+
+        app.scroll_log_tail_up(1);
+        assert_eq!(app.log_tail_scroll_offset(), 1);
+
+        app.scroll_log_tail_up(10);
+        assert_eq!(app.log_tail_scroll_offset(), 2);
+
+        app.scroll_log_tail_down(1);
+        assert_eq!(app.log_tail_scroll_offset(), 1);
+
+        app.push_log_filter_char('3');
+        assert_eq!(app.log_tail_scroll_offset(), 0);
+
+        app.clear_log_filter();
+        app.scroll_log_tail_to_oldest();
+        assert_eq!(app.log_tail_scroll_offset(), 2);
+
+        app.scroll_log_tail_to_latest();
+        assert_eq!(app.log_tail_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn preserves_tail_scroll_position_when_new_matching_entries_arrive() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.log_entries = vec![
+            LogEntry {
+                timestamp_ns: 1,
+                line: String::from("match 1"),
+            },
+            LogEntry {
+                timestamp_ns: 2,
+                line: String::from("match 2"),
+            },
+            LogEntry {
+                timestamp_ns: 3,
+                line: String::from("match 3"),
+            },
+        ];
+
+        app.scroll_log_tail_up(1);
+        app.append_log_entries(vec![LogEntry {
+            timestamp_ns: 4,
+            line: String::from("match 4"),
+        }]);
+        assert_eq!(app.log_tail_scroll_offset(), 2);
+
+        app.push_log_filter_char('1');
+        app.scroll_log_tail_to_latest();
+        app.append_log_entries(vec![LogEntry {
+            timestamp_ns: 5,
+            line: String::from("other"),
+        }]);
+        assert_eq!(app.log_tail_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn preserves_loaded_logs_per_host_and_log_selection() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.log_hosts = vec![String::from("host-a"), String::from("host-b")];
+        app.log_names = vec![String::from("kernel"), String::from("tailscaled")];
+
+        app.log_entries = vec![
+            LogEntry {
+                timestamp_ns: 1,
+                line: String::from("host-a kernel line 1"),
+            },
+            LogEntry {
+                timestamp_ns: 2,
+                line: String::from("host-a kernel line 2"),
+            },
+        ];
+        app.last_log_timestamp_ns = Some(2);
+        app.log_tail_offset = 1;
+        app.store_current_log_stream();
+
+        app.log_focus = LogFocus::Logs;
+        app.next_log_option();
+        assert!(app.log_entries.is_empty());
+        assert_eq!(app.last_log_timestamp_ns, None);
+        assert_eq!(app.log_tail_scroll_offset(), 0);
+
+        app.log_entries = vec![LogEntry {
+            timestamp_ns: 3,
+            line: String::from("host-a tailscaled line"),
+        }];
+        app.last_log_timestamp_ns = Some(3);
+        app.log_tail_offset = 0;
+        app.store_current_log_stream();
+
+        app.log_focus = LogFocus::Hosts;
+        app.next_log_option();
+        assert!(app.log_entries.is_empty());
+        assert_eq!(app.last_log_timestamp_ns, None);
+        assert_eq!(app.log_tail_scroll_offset(), 0);
+
+        app.log_entries = vec![
+            LogEntry {
+                timestamp_ns: 4,
+                line: String::from("host-b tailscaled line 1"),
+            },
+            LogEntry {
+                timestamp_ns: 5,
+                line: String::from("host-b tailscaled line 2"),
+            },
+            LogEntry {
+                timestamp_ns: 6,
+                line: String::from("host-b tailscaled line 3"),
+            },
+        ];
+        app.last_log_timestamp_ns = Some(6);
+        app.log_tail_offset = 2;
+        app.store_current_log_stream();
+
+        app.previous_log_option();
+        assert_eq!(app.selected_log_host(), Some("host-a"));
+        assert_eq!(app.selected_log_name(), Some("tailscaled"));
+        assert_eq!(
+            app.log_entries,
+            vec![LogEntry {
+                timestamp_ns: 3,
+                line: String::from("host-a tailscaled line"),
+            }]
+        );
+        assert_eq!(app.last_log_timestamp_ns, Some(3));
+        assert_eq!(app.log_tail_scroll_offset(), 0);
+
+        app.log_focus = LogFocus::Logs;
+        app.previous_log_option();
+        assert_eq!(app.selected_log_host(), Some("host-a"));
+        assert_eq!(app.selected_log_name(), Some("kernel"));
+        assert_eq!(
+            app.log_entries,
+            vec![
+                LogEntry {
+                    timestamp_ns: 1,
+                    line: String::from("host-a kernel line 1"),
+                },
+                LogEntry {
+                    timestamp_ns: 2,
+                    line: String::from("host-a kernel line 2"),
+                },
+            ]
+        );
+        assert_eq!(app.last_log_timestamp_ns, Some(2));
+        assert_eq!(app.log_tail_scroll_offset(), 1);
     }
 
     #[test]
