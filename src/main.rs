@@ -171,37 +171,43 @@ fn handle_log_key(app: &mut App, key: KeyEvent) -> AppAction {
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.previous_log_focus(),
         KeyCode::Down | KeyCode::Char('j') => {
             if app.log_focus == crate::app::LogFocus::Tail {
-                app.scroll_log_tail_down(1);
+                app.move_log_tail_down(1);
             } else {
                 app.next_log_option();
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.log_focus == crate::app::LogFocus::Tail {
-                app.scroll_log_tail_up(1);
+                app.move_log_tail_up(1);
             } else {
                 app.previous_log_option();
             }
         }
         KeyCode::PageDown => {
             if app.log_focus == crate::app::LogFocus::Tail {
-                app.scroll_log_tail_down(10);
+                app.move_log_tail_down(10);
             }
         }
         KeyCode::PageUp => {
             if app.log_focus == crate::app::LogFocus::Tail {
-                app.scroll_log_tail_up(10);
+                app.move_log_tail_up(10);
             }
         }
         KeyCode::Home => {
             if app.log_focus == crate::app::LogFocus::Tail {
-                app.scroll_log_tail_to_oldest();
+                app.move_log_tail_to_oldest();
             }
         }
         KeyCode::End => {
             if app.log_focus == crate::app::LogFocus::Tail {
-                app.scroll_log_tail_to_latest();
+                app.move_log_tail_to_latest();
             }
+        }
+        KeyCode::Char(' ') if app.log_focus == crate::app::LogFocus::Tail => {
+            app.toggle_log_selection();
+        }
+        KeyCode::Char('c') if app.log_focus == crate::app::LogFocus::Tail => {
+            app.clear_log_selection();
         }
         KeyCode::Char('r') => {
             app.reload_logs_screen();

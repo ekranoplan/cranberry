@@ -199,21 +199,49 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
 
     let filtered_entries = app.visible_log_entries();
     let visible = vertical[2].height.saturating_sub(2) as usize;
-    let start = tail_window_start(
+    let start = window_start(
+        app.log_tail_cursor(),
         filtered_entries.len(),
         visible.max(1),
-        app.log_tail_scroll_offset(),
     );
     let lines: Vec<Line> = filtered_entries
         .iter()
         .skip(start)
         .take(visible.max(1))
-        .map(|entry| {
+        .enumerate()
+        .map(|(offset, entry)| {
             let timestamp = format_log_timestamp(entry.timestamp_ns);
+            let is_cursor = start + offset == app.log_tail_cursor();
+            let marker = if app.is_log_entry_selected(entry) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let text_style = if is_cursor {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
             Line::from(vec![
-                Span::styled(timestamp, Style::default().fg(Color::Blue)),
+                Span::styled(
+                    if is_cursor { "> " } else { "  " },
+                    text_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    marker,
+                    if app.is_log_entry_selected(entry) {
+                        text_style.fg(Color::LightGreen)
+                    } else {
+                        text_style
+                    },
+                ),
                 Span::raw(" "),
-                Span::raw(entry.line.as_str()),
+                Span::styled(timestamp, text_style.fg(Color::Blue)),
+                Span::raw(" "),
+                Span::styled(
+                    sanitize_log_line_for_display(entry.line.as_str()),
+                    text_style,
+                ),
             ])
         })
         .collect();
@@ -239,7 +267,7 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
     frame.render_widget(log_body, vertical[2]);
 
     let footer = Paragraph::new(
-        "Esc back | Tab/Shift-Tab or h/l switch pane | j/k move or scroll | PgUp/PgDn/Home/End tail | / filter | r reload labels/logs | q quit",
+        "Esc back | Tab/Shift-Tab or h/l switch pane | j/k move cursor | Space mark | c clear marks | PgUp/PgDn/Home/End tail | / filter | r reload labels/logs | q quit",
     )
     .block(Block::default().borders(Borders::ALL).title("Help"));
     frame.render_widget(footer, vertical[3]);
@@ -508,14 +536,6 @@ fn window_start(selected: usize, len: usize, visible: usize) -> usize {
         .min(max_start)
 }
 
-fn tail_window_start(len: usize, visible: usize, offset: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-
-    len.saturating_sub(visible.saturating_add(offset))
-}
-
 fn visible_list_items<T, F>(
     items: &[T],
     start: usize,
@@ -574,6 +594,41 @@ fn format_log_timestamp(timestamp_ns: i64) -> String {
         .to_string()
 }
 
+fn sanitize_log_line_for_display(line: &str) -> String {
+    let segment = line
+        .split('\r')
+        .rev()
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("");
+    strip_ansi_and_control_chars(segment)
+}
+
+fn strip_ansi_and_control_chars(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.next_if_eq(&'[').is_some() {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '\n' | '\t' => sanitized.push(' '),
+            ch if ch.is_control() => {}
+            _ => sanitized.push(ch),
+        }
+    }
+
+    sanitized
+}
+
 fn format_metric_details(metric: &MetricSample) -> String {
     format!(
         "name: {}\nvalue: {}\n\nlabels:\n{}",
@@ -604,7 +659,7 @@ fn render_empty_history(frame: &mut Frame, area: Rect, title: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_table_rows, metric_unit_from_name};
+    use super::{history_table_rows, metric_unit_from_name, sanitize_log_line_for_display};
 
     #[test]
     fn history_table_rows_show_latest_first() {
@@ -651,6 +706,23 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn sanitize_log_line_keeps_latest_carriage_return_segment() {
+        let line = "  0%|          | 0/20 [00:00<?, ?it/s]\r 35%|███▌      | 7/20 [00:37<01:27,  6.75s/it]";
+
+        assert_eq!(
+            sanitize_log_line_for_display(line),
+            " 35%|███▌      | 7/20 [00:37<01:27,  6.75s/it]"
+        );
+    }
+
+    #[test]
+    fn sanitize_log_line_strips_ansi_and_control_characters() {
+        let line = "\u{1b}[32mready\u{1b}[0m\tstatus\nok\u{7}";
+
+        assert_eq!(sanitize_log_line_for_display(line), "ready status ok");
     }
 
     #[test]

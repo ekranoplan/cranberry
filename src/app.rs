@@ -12,12 +12,14 @@ const HISTORY_LIMIT: usize = 60;
 const LOG_ENTRY_LIMIT: usize = 3000;
 
 type LogStreamKey = (String, String);
+type LogEntryKey = (i64, String);
 
 #[derive(Clone, Debug, Default)]
 struct LogStreamState {
     entries: Vec<LogEntry>,
     last_timestamp_ns: Option<i64>,
-    tail_offset: usize,
+    tail_cursor: usize,
+    selected_entries: BTreeSet<LogEntryKey>,
 }
 
 pub struct App {
@@ -45,7 +47,8 @@ pub struct App {
     loki: Option<LokiClient>,
     loki_poll_secs: u64,
     log_streams: BTreeMap<LogStreamKey, LogStreamState>,
-    log_tail_offset: usize,
+    log_tail_cursor: usize,
+    selected_log_entries: BTreeSet<LogEntryKey>,
     last_log_timestamp_ns: Option<i64>,
     display: DisplayConfig,
     all_metrics: Vec<MetricSample>,
@@ -141,7 +144,8 @@ impl App {
             loki,
             loki_poll_secs,
             log_streams: BTreeMap::new(),
-            log_tail_offset: 0,
+            log_tail_cursor: 0,
+            selected_log_entries: BTreeSet::new(),
             last_log_timestamp_ns: None,
             display,
             all_metrics: Vec::new(),
@@ -391,52 +395,82 @@ impl App {
     }
 
     pub fn push_log_filter_char(&mut self, ch: char) {
+        let previous_selection = self.selected_visible_log_entry_key();
         self.log_filter_query.push(ch);
-        self.clamp_log_tail_offset();
+        self.restore_log_cursor(previous_selection.as_ref());
         self.store_current_log_stream();
         self.status = format!("filter logs: {}", self.log_filter_query);
         info!(filter = %self.log_filter_query, added = %ch, "updated log filter query");
     }
 
     pub fn pop_log_filter_char(&mut self) {
+        let previous_selection = self.selected_visible_log_entry_key();
         self.log_filter_query.pop();
-        self.clamp_log_tail_offset();
+        self.restore_log_cursor(previous_selection.as_ref());
         self.store_current_log_stream();
         self.status = format!("filter logs: {}", self.log_filter_query);
         info!(filter = %self.log_filter_query, "deleted log filter character");
     }
 
     pub fn clear_log_filter(&mut self) {
+        let previous_selection = self.selected_visible_log_entry_key();
         self.log_filter_query.clear();
-        self.clamp_log_tail_offset();
+        self.restore_log_cursor(previous_selection.as_ref());
         self.store_current_log_stream();
         self.status = String::from("log filter cleared");
         info!("cleared log filter query");
     }
 
-    pub fn log_tail_scroll_offset(&self) -> usize {
-        self.log_tail_offset
+    pub fn log_tail_cursor(&self) -> usize {
+        self.log_tail_cursor
     }
 
-    pub fn scroll_log_tail_up(&mut self, step: usize) {
-        self.log_tail_offset = self.log_tail_offset.saturating_add(step);
-        self.clamp_log_tail_offset();
+    pub fn move_log_tail_up(&mut self, step: usize) {
+        self.log_tail_cursor = self.log_tail_cursor.saturating_sub(step);
         self.store_current_log_stream();
     }
 
-    pub fn scroll_log_tail_down(&mut self, step: usize) {
-        self.log_tail_offset = self.log_tail_offset.saturating_sub(step);
+    pub fn move_log_tail_down(&mut self, step: usize) {
+        self.log_tail_cursor = self
+            .log_tail_cursor
+            .saturating_add(step)
+            .min(self.max_log_tail_cursor());
         self.store_current_log_stream();
     }
 
-    pub fn scroll_log_tail_to_oldest(&mut self) {
-        self.log_tail_offset = self.max_log_tail_offset();
+    pub fn move_log_tail_to_oldest(&mut self) {
+        self.log_tail_cursor = 0;
         self.store_current_log_stream();
     }
 
-    pub fn scroll_log_tail_to_latest(&mut self) {
-        self.log_tail_offset = 0;
+    pub fn move_log_tail_to_latest(&mut self) {
+        self.log_tail_cursor = self.max_log_tail_cursor();
         self.store_current_log_stream();
+    }
+
+    pub fn toggle_log_selection(&mut self) {
+        let Some(entry) = self.selected_visible_log_entry() else {
+            return;
+        };
+        let key = log_entry_key(entry);
+        let label = entry.line.clone();
+        if self.selected_log_entries.remove(&key) {
+            self.status = format!("unmarked log: {label}");
+        } else {
+            self.selected_log_entries.insert(key);
+            self.status = format!("marked log: {label}");
+        }
+        self.store_current_log_stream();
+    }
+
+    pub fn clear_log_selection(&mut self) {
+        self.selected_log_entries.clear();
+        self.status = String::from("log marks cleared");
+        self.store_current_log_stream();
+    }
+
+    pub fn is_log_entry_selected(&self, entry: &LogEntry) -> bool {
+        self.selected_log_entries.contains(&log_entry_key(entry))
     }
 
     pub fn refresh_logs(&mut self) {
@@ -486,7 +520,8 @@ impl App {
     fn clear_current_log_stream(&mut self) {
         self.last_log_timestamp_ns = None;
         self.log_entries.clear();
-        self.log_tail_offset = 0;
+        self.log_tail_cursor = 0;
+        self.selected_log_entries.clear();
     }
 
     fn current_log_stream_key(&self) -> Option<LogStreamKey> {
@@ -505,8 +540,9 @@ impl App {
         if let Some(state) = self.log_streams.get(&key) {
             self.last_log_timestamp_ns = state.last_timestamp_ns;
             self.log_entries = state.entries.clone();
-            self.log_tail_offset = state.tail_offset;
-            self.clamp_log_tail_offset();
+            self.log_tail_cursor = state.tail_cursor;
+            self.selected_log_entries = state.selected_entries.clone();
+            self.clamp_log_tail_cursor();
         } else {
             self.clear_current_log_stream();
         }
@@ -522,21 +558,15 @@ impl App {
             LogStreamState {
                 entries: self.log_entries.clone(),
                 last_timestamp_ns: self.last_log_timestamp_ns,
-                tail_offset: self.log_tail_offset,
+                tail_cursor: self.log_tail_cursor,
+                selected_entries: self.selected_log_entries.clone(),
             },
         );
     }
 
     fn append_log_entries(&mut self, entries: Vec<LogEntry>) {
-        let needle = self.log_filter_query.to_lowercase();
-        let appended_visible = if self.log_tail_offset == 0 {
-            0
-        } else {
-            entries
-                .iter()
-                .filter(|entry| self.matches_log_filter_with(&needle, entry))
-                .count()
-        };
+        let previous_selection = self.selected_visible_log_entry_key();
+        let was_at_latest = self.log_tail_cursor == self.max_log_tail_cursor();
 
         if let Some(last) = entries.last() {
             self.last_log_timestamp_ns = Some(last.timestamp_ns);
@@ -548,21 +578,61 @@ impl App {
             self.log_entries.drain(0..drop_len);
         }
 
-        if appended_visible > 0 {
-            self.log_tail_offset = self.log_tail_offset.saturating_add(appended_visible);
+        self.retain_visible_log_selection();
+
+        if was_at_latest {
+            self.log_tail_cursor = self.max_log_tail_cursor();
+        } else {
+            self.restore_log_cursor(previous_selection.as_ref());
         }
 
-        self.clamp_log_tail_offset();
         self.store_current_log_stream();
         self.update_log_status();
     }
 
-    fn clamp_log_tail_offset(&mut self) {
-        self.log_tail_offset = self.log_tail_offset.min(self.max_log_tail_offset());
+    fn clamp_log_tail_cursor(&mut self) {
+        self.log_tail_cursor = self.log_tail_cursor.min(self.max_log_tail_cursor());
     }
 
-    fn max_log_tail_offset(&self) -> usize {
+    fn max_log_tail_cursor(&self) -> usize {
         self.visible_log_entries().len().saturating_sub(1)
+    }
+
+    fn selected_visible_log_entry(&self) -> Option<&LogEntry> {
+        self.visible_log_entries()
+            .get(self.log_tail_cursor)
+            .copied()
+    }
+
+    fn selected_visible_log_entry_key(&self) -> Option<LogEntryKey> {
+        self.selected_visible_log_entry().map(log_entry_key)
+    }
+
+    fn restore_log_cursor(&mut self, previous_selection: Option<&LogEntryKey>) {
+        let visible = self.visible_log_entries();
+        if visible.is_empty() {
+            self.log_tail_cursor = 0;
+            return;
+        }
+
+        if let Some(previous_selection) = previous_selection {
+            if let Some(index) = visible
+                .iter()
+                .position(|entry| log_entry_key(entry) == *previous_selection)
+            {
+                self.log_tail_cursor = index;
+                return;
+            }
+        }
+
+        self.clamp_log_tail_cursor();
+    }
+
+    fn retain_visible_log_selection(&mut self) {
+        let visible_keys: BTreeSet<LogEntryKey> =
+            self.log_entries.iter().map(log_entry_key).collect();
+        self.selected_log_entries
+            .retain(|entry_key| visible_keys.contains(entry_key));
     }
 
     fn refresh_log_options(&mut self) {
@@ -1206,6 +1276,10 @@ fn metric_key(metric: &MetricSample) -> MetricKey {
     (metric.name.clone(), metric.labels.clone())
 }
 
+fn log_entry_key(entry: &LogEntry) -> LogEntryKey {
+    (entry.timestamp_ns, entry.line.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{App, HistoryView, LogFocus, TargetFilter, HISTORY_LIMIT};
@@ -1481,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolls_tail_offset_and_clamps_to_visible_logs() {
+    fn moves_log_tail_cursor_and_clamps_to_visible_logs() {
         let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
         app.log_entries = vec![
             LogEntry {
@@ -1498,28 +1572,28 @@ mod tests {
             },
         ];
 
-        app.scroll_log_tail_up(1);
-        assert_eq!(app.log_tail_scroll_offset(), 1);
+        app.move_log_tail_down(1);
+        assert_eq!(app.log_tail_cursor(), 1);
 
-        app.scroll_log_tail_up(10);
-        assert_eq!(app.log_tail_scroll_offset(), 2);
+        app.move_log_tail_down(10);
+        assert_eq!(app.log_tail_cursor(), 2);
 
-        app.scroll_log_tail_down(1);
-        assert_eq!(app.log_tail_scroll_offset(), 1);
+        app.move_log_tail_up(1);
+        assert_eq!(app.log_tail_cursor(), 1);
 
         app.push_log_filter_char('3');
-        assert_eq!(app.log_tail_scroll_offset(), 0);
+        assert_eq!(app.log_tail_cursor(), 0);
 
         app.clear_log_filter();
-        app.scroll_log_tail_to_oldest();
-        assert_eq!(app.log_tail_scroll_offset(), 2);
+        app.move_log_tail_to_oldest();
+        assert_eq!(app.log_tail_cursor(), 0);
 
-        app.scroll_log_tail_to_latest();
-        assert_eq!(app.log_tail_scroll_offset(), 0);
+        app.move_log_tail_to_latest();
+        assert_eq!(app.log_tail_cursor(), 2);
     }
 
     #[test]
-    fn preserves_tail_scroll_position_when_new_matching_entries_arrive() {
+    fn preserves_log_tail_cursor_when_new_matching_entries_arrive() {
         let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
         app.log_entries = vec![
             LogEntry {
@@ -1536,20 +1610,47 @@ mod tests {
             },
         ];
 
-        app.scroll_log_tail_up(1);
+        app.move_log_tail_down(1);
         app.append_log_entries(vec![LogEntry {
             timestamp_ns: 4,
             line: String::from("match 4"),
         }]);
-        assert_eq!(app.log_tail_scroll_offset(), 2);
+        assert_eq!(app.log_tail_cursor(), 1);
 
         app.push_log_filter_char('1');
-        app.scroll_log_tail_to_latest();
+        app.move_log_tail_to_latest();
         app.append_log_entries(vec![LogEntry {
             timestamp_ns: 5,
             line: String::from("other"),
         }]);
-        assert_eq!(app.log_tail_scroll_offset(), 0);
+        assert_eq!(app.log_tail_cursor(), 0);
+    }
+
+    #[test]
+    fn marks_selected_log_entries_and_clears_marks() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.log_entries = vec![
+            LogEntry {
+                timestamp_ns: 1,
+                line: String::from("line 1"),
+            },
+            LogEntry {
+                timestamp_ns: 2,
+                line: String::from("line 2"),
+            },
+        ];
+
+        app.move_log_tail_to_latest();
+        app.toggle_log_selection();
+        assert!(app.is_log_entry_selected(&app.log_entries[1]));
+
+        app.move_log_tail_up(1);
+        app.toggle_log_selection();
+        assert!(app.is_log_entry_selected(&app.log_entries[0]));
+
+        app.clear_log_selection();
+        assert!(!app.is_log_entry_selected(&app.log_entries[0]));
+        assert!(!app.is_log_entry_selected(&app.log_entries[1]));
     }
 
     #[test]
@@ -1569,28 +1670,28 @@ mod tests {
             },
         ];
         app.last_log_timestamp_ns = Some(2);
-        app.log_tail_offset = 1;
+        app.log_tail_cursor = 1;
         app.store_current_log_stream();
 
         app.log_focus = LogFocus::Logs;
         app.next_log_option();
         assert!(app.log_entries.is_empty());
         assert_eq!(app.last_log_timestamp_ns, None);
-        assert_eq!(app.log_tail_scroll_offset(), 0);
+        assert_eq!(app.log_tail_cursor(), 0);
 
         app.log_entries = vec![LogEntry {
             timestamp_ns: 3,
             line: String::from("host-a tailscaled line"),
         }];
         app.last_log_timestamp_ns = Some(3);
-        app.log_tail_offset = 0;
+        app.log_tail_cursor = 0;
         app.store_current_log_stream();
 
         app.log_focus = LogFocus::Hosts;
         app.next_log_option();
         assert!(app.log_entries.is_empty());
         assert_eq!(app.last_log_timestamp_ns, None);
-        assert_eq!(app.log_tail_scroll_offset(), 0);
+        assert_eq!(app.log_tail_cursor(), 0);
 
         app.log_entries = vec![
             LogEntry {
@@ -1607,7 +1708,7 @@ mod tests {
             },
         ];
         app.last_log_timestamp_ns = Some(6);
-        app.log_tail_offset = 2;
+        app.log_tail_cursor = 2;
         app.store_current_log_stream();
 
         app.previous_log_option();
@@ -1621,7 +1722,7 @@ mod tests {
             }]
         );
         assert_eq!(app.last_log_timestamp_ns, Some(3));
-        assert_eq!(app.log_tail_scroll_offset(), 0);
+        assert_eq!(app.log_tail_cursor(), 0);
 
         app.log_focus = LogFocus::Logs;
         app.previous_log_option();
@@ -1641,7 +1742,7 @@ mod tests {
             ]
         );
         assert_eq!(app.last_log_timestamp_ns, Some(2));
-        assert_eq!(app.log_tail_scroll_offset(), 1);
+        assert_eq!(app.log_tail_cursor(), 1);
     }
 
     #[test]
