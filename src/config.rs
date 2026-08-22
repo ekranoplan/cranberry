@@ -12,6 +12,15 @@ pub struct Config {
     pub display: DisplayConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default, rename = "dashboard")]
+    pub dashboards: Vec<DashboardConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DashboardConfig {
+    pub name: String,
+    pub query: String,
+    pub history_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -31,6 +40,8 @@ pub struct LokiConfig {
     pub poll_secs: u64,
     #[serde(default = "default_loki_lookback_secs")]
     pub lookback_secs: u64,
+    #[serde(default = "default_metric_host_label")]
+    pub metric_host_label: String,
 }
 
 impl Default for LokiConfig {
@@ -41,6 +52,7 @@ impl Default for LokiConfig {
             log_label: default_loki_log_label(),
             poll_secs: default_loki_poll_secs(),
             lookback_secs: default_loki_lookback_secs(),
+            metric_host_label: default_metric_host_label(),
         }
     }
 }
@@ -97,6 +109,10 @@ fn default_loki_lookback_secs() -> u64 {
     1200
 }
 
+fn default_metric_host_label() -> String {
+    String::from("instance")
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
@@ -148,6 +164,7 @@ mod tests {
         assert_eq!(config.loki.log_label, "job");
         assert_eq!(config.loki.poll_secs, 1);
         assert_eq!(config.loki.lookback_secs, 1200);
+        assert_eq!(config.loki.metric_host_label, "instance");
     }
 
     #[test]
@@ -175,6 +192,7 @@ mod tests {
             log_label = "container"
             poll_secs = 2
             lookback_secs = 120
+            metric_host_label = "node"
             "#,
         )
         .expect("config should parse");
@@ -187,6 +205,24 @@ mod tests {
         assert_eq!(config.loki.log_label, "container");
         assert_eq!(config.loki.poll_secs, 2);
         assert_eq!(config.loki.lookback_secs, 120);
+        assert_eq!(config.loki.metric_host_label, "node");
+    }
+
+    #[test]
+    fn parses_dashboard_presets() {
+        let config: Config = toml::from_str(
+            r#"
+            [[dashboard]]
+            name = "Errors"
+            query = "sum(rate(http_requests_total{code=~\"5..\"}[5m]))"
+            history_secs = 3600
+            "#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.dashboards.len(), 1);
+        assert_eq!(config.dashboards[0].name, "Errors");
+        assert_eq!(config.dashboards[0].history_secs, Some(3600));
     }
 
     #[test]

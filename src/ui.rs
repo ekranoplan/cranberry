@@ -24,51 +24,64 @@ pub fn render(frame: &mut Frame, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "Cranberry",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  source: "),
-        Span::styled(app.source_label.as_str(), Style::default().fg(Color::Green)),
-        Span::raw("  target: "),
-        Span::styled(
-            app.selected_target().to_string(),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("  refresh: "),
-        Span::styled(
-            format!("{}s", app.refresh_secs()),
-            Style::default().fg(Color::Blue),
-        ),
-        Span::raw("  filter: "),
-        Span::styled(
-            if app.filter_query.is_empty() {
-                "*"
-            } else {
-                app.filter_query.as_str()
-            },
-            Style::default().fg(Color::Magenta),
-        ),
-        Span::raw("  metrics: "),
-        Span::styled(
-            app.metrics.len().to_string(),
-            Style::default().fg(Color::LightRed),
-        ),
-        Span::raw("  selected: "),
-        Span::styled(
-            app.selected_metrics_len().to_string(),
-            Style::default().fg(Color::LightGreen),
-        ),
-    ]))
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Cranberry",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  source: "),
+            Span::styled(app.source_label.as_str(), Style::default().fg(Color::Green)),
+            Span::raw("  target: "),
+            Span::styled(
+                app.selected_target().to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("  refresh: "),
+            Span::styled(
+                format!("{}s", app.refresh_secs()),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw("  state: "),
+            Span::styled(
+                app.refresh_state_label(),
+                Style::default().fg(Color::LightGreen),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("filter: "),
+            Span::styled(
+                if app.filter_query.is_empty() {
+                    "*"
+                } else {
+                    app.filter_query.as_str()
+                },
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw("  metrics: "),
+            Span::styled(
+                app.metrics.len().to_string(),
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::raw("  selected: "),
+            Span::styled(
+                app.selected_metrics_len().to_string(),
+                Style::default().fg(Color::LightGreen),
+            ),
+            Span::raw("  range: "),
+            Span::styled(app.history_range_label(), Style::default().fg(Color::Blue)),
+            Span::raw("  dashboard: "),
+            Span::styled(app.dashboard_label(), Style::default().fg(Color::LightCyan)),
+        ]),
+    ])
     .block(Block::default().borders(Borders::ALL).title("Overview"));
 
     frame.render_widget(header, vertical[0]);
@@ -118,15 +131,22 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_history(frame, app, detail_layout[1]);
 
     let footer = Paragraph::new(
-        "q quit | j/k move | Space toggle select | c clear select | h history view | t target picker | l logs | / filter | r reload now",
+        "q quit | j/k move | Space select | h graph/table | 1/2/3/4 live/1h/6h/24h | p PromQL | d preset | l logs | r reload",
     )
-    .block(Block::default().borders(Borders::ALL).title("Help"));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Help")
+            .title_bottom(Line::from(app.status.as_str()).alignment(Alignment::Right)),
+    );
     frame.render_widget(footer, vertical[2]);
 
     if app.target_picker_open {
         render_target_picker(frame, app);
     } else if app.filter_input_open {
         render_filter_input(frame, app);
+    } else if app.promql_input_open {
+        render_promql_input(frame, app);
     }
 }
 
@@ -269,7 +289,12 @@ fn render_logs_screen(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(
         "Esc back | Tab/Shift-Tab or h/l switch pane | j/k move cursor | Space mark | c clear marks | PgUp/PgDn/Home/End tail | / filter | r reload labels/logs | q quit",
     )
-    .block(Block::default().borders(Borders::ALL).title("Help"));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Help")
+            .title_bottom(Line::from(app.status.as_str()).alignment(Alignment::Right)),
+    );
     frame.render_widget(footer, vertical[3]);
 
     if app.log_filter_input_open {
@@ -339,6 +364,17 @@ fn render_log_filter_input(frame: &mut Frame, app: &App) {
     frame.render_widget(prompt, area);
 }
 
+fn render_promql_input(frame: &mut Frame, app: &App) {
+    let area = centered_rect(frame.area(), 80, 25);
+    frame.render_widget(Clear, area);
+    let prompt = Paragraph::new(format!(
+        "PromQL\n\n{}\n\nEnter execute | Esc cancel | Backspace delete | Ctrl-U clear",
+        app.promql_query
+    ))
+    .block(Block::default().borders(Borders::ALL).title("PromQL Query"));
+    frame.render_widget(prompt, area);
+}
+
 fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     match app.history_view {
         HistoryView::Graph => render_history_chart(frame, app, area),
@@ -347,8 +383,8 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
-    let history = app.selected_metric_history();
-    if history.is_empty() {
+    let series = app.displayed_metric_histories();
+    if series.is_empty() || series.iter().all(|(_, history)| history.is_empty()) {
         render_empty_history(
             frame,
             area,
@@ -356,27 +392,58 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let unit = selected_metric_unit(app);
+    let unit = common_metric_unit(&series);
 
-    let min = history.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = history.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = series
+        .iter()
+        .flat_map(|(_, history)| history.iter().copied())
+        .fold(f64::INFINITY, f64::min);
+    let max = series
+        .iter()
+        .flat_map(|(_, history)| history.iter().copied())
+        .fold(f64::NEG_INFINITY, f64::max);
     let (min, max) = if (max - min).abs() < f64::EPSILON {
         (min - 1.0, max + 1.0)
     } else {
         (min, max)
     };
 
-    let points: Vec<(f64, f64)> = history
+    let point_sets: Vec<Vec<(f64, f64)>> = series
         .iter()
-        .enumerate()
-        .map(|(index, value)| (index as f64, *value))
+        .map(|(_, history)| {
+            history
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index as f64, *value))
+                .collect()
+        })
         .collect();
-    let x_max = points.len().saturating_sub(1) as f64;
-    let datasets = vec![Dataset::default()
-        .name("value")
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Cyan))
-        .data(&points)];
+    let x_max = point_sets
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .saturating_sub(1) as f64;
+    let colors = [
+        Color::Cyan,
+        Color::Yellow,
+        Color::LightGreen,
+        Color::Magenta,
+        Color::LightBlue,
+        Color::LightRed,
+    ];
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .zip(point_sets.iter())
+        .enumerate()
+        .map(|(index, ((metric, _), points))| {
+            Dataset::default()
+                .name(compact_series_label(metric))
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(colors[index % colors.len()]))
+                .data(points)
+        })
+        .collect();
 
     let chart = Chart::new(datasets)
         .block(
@@ -398,6 +465,11 @@ fn render_history_chart(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_history_table(frame: &mut Frame, app: &App, area: Rect) {
+    let series = app.displayed_metric_histories();
+    if series.len() > 1 {
+        render_history_summary_table(frame, area, &series);
+        return;
+    }
     let history = app.selected_metric_history();
     let unit = selected_metric_unit(app);
     if history.is_empty() {
@@ -441,6 +513,90 @@ fn render_history_table(frame: &mut Frame, app: &App, area: Rect) {
     .column_spacing(1);
 
     frame.render_widget(table, area);
+}
+
+fn render_history_summary_table(
+    frame: &mut Frame,
+    area: Rect,
+    series: &[(MetricSample, Vec<f64>)],
+) {
+    let rows = series.iter().map(|(metric, history)| {
+        let latest = history.last().copied();
+        let delta = history.iter().rev().take(2).copied().collect::<Vec<_>>();
+        let min = history.iter().copied().reduce(f64::min);
+        let max = history.iter().copied().reduce(f64::max);
+        Row::new(vec![
+            Cell::from(metric_series_label(metric)),
+            Cell::from(format_optional_value(latest)),
+            Cell::from(if delta.len() == 2 {
+                format!("{:+.3}", delta[0] - delta[1])
+            } else {
+                String::from("n/a")
+            }),
+            Cell::from(format_optional_value(min)),
+            Cell::from(format_optional_value(max)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(40),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+        ],
+    )
+    .header(
+        Row::new(["Series", "Latest", "Delta", "Min", "Max"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("History (Comparison)"),
+    );
+    frame.render_widget(table, area);
+}
+
+fn format_optional_value(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| String::from("n/a"))
+}
+
+fn metric_series_label(metric: &MetricSample) -> String {
+    let identity = metric
+        .labels
+        .iter()
+        .find(|(key, _)| matches!(key.as_str(), "instance" | "target" | "job"))
+        .map(|(_, value)| value.as_str());
+    match identity {
+        Some(identity) => format!("{} [{}]", metric.name, identity),
+        None => metric.name.clone(),
+    }
+}
+
+fn compact_series_label(metric: &MetricSample) -> String {
+    let label = metric_series_label(metric);
+    const MAX_CHARS: usize = 28;
+    if label.chars().count() <= MAX_CHARS {
+        return label;
+    }
+    let mut compact: String = label.chars().take(MAX_CHARS - 1).collect();
+    compact.push('…');
+    compact
+}
+
+fn common_metric_unit(series: &[(MetricSample, Vec<f64>)]) -> Option<&str> {
+    let first = series
+        .first()
+        .and_then(|(metric, _)| metric_unit_from_name(&metric.name));
+    series
+        .iter()
+        .all(|(metric, _)| metric_unit_from_name(&metric.name) == first)
+        .then_some(first)
+        .flatten()
 }
 
 fn history_table_rows(
@@ -659,7 +815,37 @@ fn render_empty_history(frame: &mut Frame, area: Rect, title: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_table_rows, metric_unit_from_name, sanitize_log_line_for_display};
+    use super::{history_table_rows, metric_unit_from_name, render, sanitize_log_line_for_display};
+    use crate::{
+        app::App,
+        config::{DisplayConfig, PrometheusConfig},
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn renders_selected_metric_series_in_comparison_chart() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.cursor = 0;
+        app.toggle_metric_selection();
+        app.cursor = 1;
+        app.toggle_metric_selection();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal should be created");
+
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("dashboard should render");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("selected: 2"));
+        assert!(rendered.contains("History (Graph)"));
+    }
 
     #[test]
     fn history_table_rows_show_latest_first() {

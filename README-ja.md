@@ -37,6 +37,7 @@ host_label = "host"
 log_label = "job"
 poll_secs = 1
 lookback_secs = 1200
+metric_host_label = "instance"
 
 [display]
 max_metrics = 20
@@ -46,6 +47,11 @@ refresh_secs = 15
 [logging]
 path = "cranberry.log"
 level = "info"
+
+[[dashboard]]
+name = "HTTP errors"
+query = "sum by (job) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+history_secs = 3600
 ```
 
 利用できる設定項目:
@@ -59,6 +65,8 @@ level = "info"
 - `loki.log_label`: ログ種別選択に使うラベル名。デフォルトは `job`
 - `loki.poll_secs`: ログ更新のポーリング間隔（秒）。デフォルトは `1`
 - `loki.lookback_secs`: ログ画面を開いたときの初期取得範囲（秒）。デフォルトは `1200`
+- `loki.metric_host_label`: メトリクス画面からログ画面へ移る際、Lokiのhostと対応付けるPrometheusラベル。デフォルトは `instance`
+- `[[dashboard]]`: `name`、`query`、任意の`history_secs`からなるPromQLプリセット。複数定義可能
 - `logging.path`: ログファイルのパス。デフォルトは `cranberry.log`
 - `logging.level`: ログレベル。`trace`、`debug`、`info`、`warn`、`error` のいずれか。デフォルトは `info`
 
@@ -73,6 +81,11 @@ level = "info"
 - `l`: Loki ログビューアを開く
 - `/`: メトリクスフィルタ入力を開く
 - `r`: 即時リロード
+- `Space`: 比較グラフへ追加するメトリクスを選択
+- `h`: グラフ表示と比較テーブル表示を切り替え
+- `1` / `2` / `3` / `4`: 履歴をlive / 1時間 / 6時間 / 24時間に切り替え
+- `p`: 任意のPromQLクエリを入力して実行
+- `d`: 設定したダッシュボードプリセットを順に切り替え
 - ログ画面で `Tab` / `h` / `l`: ホスト一覧とログ一覧のフォーカスを切り替え
 - `Esc`: ターゲットピッカー、フィルタ入力、ログ画面を閉じる
 - `Enter`: ターゲットピッカーの選択を適用、またはフィルタ入力を閉じる

@@ -19,6 +19,7 @@ pub struct LokiClient {
     host_label: String,
     log_label: String,
     lookback_secs: u64,
+    metric_host_label: String,
     client: reqwest::blocking::Client,
 }
 
@@ -30,8 +31,17 @@ impl LokiClient {
             host_label: config.host_label,
             log_label: config.log_label,
             lookback_secs: config.lookback_secs,
+            metric_host_label: config.metric_host_label,
             client: reqwest::blocking::Client::new(),
         })
+    }
+
+    pub fn metric_host_label(&self) -> &str {
+        &self.metric_host_label
+    }
+
+    pub fn log_label(&self) -> &str {
+        &self.log_label
     }
 
     pub fn fetch_hosts(&self) -> Result<Vec<String>, String> {
@@ -112,7 +122,7 @@ impl LokiClient {
                 });
             }
         }
-        entries.sort_by(|left, right| left.timestamp_ns.cmp(&right.timestamp_ns));
+        entries.sort_by_key(|entry| entry.timestamp_ns);
         Ok(entries)
     }
 

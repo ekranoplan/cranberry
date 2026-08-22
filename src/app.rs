@@ -1,11 +1,13 @@
 use crate::{
-    config::{DisplayConfig, LokiConfig, PrometheusConfig},
+    config::{DashboardConfig, DisplayConfig, LokiConfig, PrometheusConfig},
     loki::{LogEntry, LokiClient},
     prometheus::{parse_metrics, MetricSample},
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use tracing::{error, info, warn};
 
 const HISTORY_LIMIT: usize = 60;
@@ -13,6 +15,8 @@ const LOG_ENTRY_LIMIT: usize = 3000;
 
 type LogStreamKey = (String, String);
 type LogEntryKey = (i64, String);
+type LogReloadResult = (LogStreamKey, Result<Vec<LogEntry>, String>);
+type LogOptionsResult = Result<LogOptionsPayload, String>;
 
 #[derive(Clone, Debug, Default)]
 struct LogStreamState {
@@ -43,6 +47,8 @@ pub struct App {
     pub log_entries: Vec<LogEntry>,
     pub log_filter_query: String,
     pub log_filter_input_open: bool,
+    pub promql_query: String,
+    pub promql_input_open: bool,
     source: DataSource,
     loki: Option<LokiClient>,
     loki_poll_secs: u64,
@@ -55,12 +61,41 @@ pub struct App {
     metric_history: BTreeMap<MetricKey, VecDeque<f64>>,
     selected_metrics: BTreeSet<MetricKey>,
     target_notice: Option<String>,
+    dashboards: Vec<DashboardConfig>,
+    dashboard_selected: Option<usize>,
+    history_range: HistoryRange,
+    reload_receiver: Option<Receiver<Result<BackgroundReload, String>>>,
+    reload_in_progress: bool,
+    last_successful_refresh: Option<String>,
+    consecutive_failures: u32,
+    log_reload_receiver: Option<Receiver<LogReloadResult>>,
+    log_options_receiver: Option<Receiver<LogOptionsResult>>,
+}
+
+struct BackgroundReload {
+    targets: Option<Vec<TargetFilter>>,
+    selected_target: Option<TargetFilter>,
+    metrics: Vec<MetricSample>,
+    histories: Option<BTreeMap<MetricKey, VecDeque<f64>>>,
+}
+
+struct LogOptionsPayload {
+    hosts: Vec<String>,
+    log_names: Vec<String>,
+    preferred_host: Option<String>,
+    preferred_log: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryView {
     Graph,
     Table,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRange {
+    Live,
+    Window(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,10 +144,20 @@ impl App {
         Self::with_loki(prometheus, LokiConfig::default(), display)
     }
 
+    #[cfg(test)]
     pub fn with_loki(
         prometheus: PrometheusConfig,
         loki: LokiConfig,
         display: DisplayConfig,
+    ) -> Self {
+        Self::with_dashboards(prometheus, loki, display, Vec::new())
+    }
+
+    pub fn with_dashboards(
+        prometheus: PrometheusConfig,
+        loki: LokiConfig,
+        display: DisplayConfig,
+        dashboards: Vec<DashboardConfig>,
     ) -> Self {
         let source = build_source(prometheus);
         let loki_poll_secs = loki.poll_secs.max(1);
@@ -140,6 +185,8 @@ impl App {
             log_entries: Vec::new(),
             log_filter_query: String::new(),
             log_filter_input_open: false,
+            promql_query: String::new(),
+            promql_input_open: false,
             source,
             loki,
             loki_poll_secs,
@@ -152,18 +199,34 @@ impl App {
             metric_history: BTreeMap::new(),
             selected_metrics: BTreeSet::new(),
             target_notice: None,
+            dashboards,
+            dashboard_selected: None,
+            history_range: HistoryRange::Live,
+            reload_receiver: None,
+            reload_in_progress: false,
+            last_successful_refresh: None,
+            consecutive_failures: 0,
+            log_reload_receiver: None,
+            log_options_receiver: None,
         };
         info!(refresh_secs, "app initialized");
-        app.reload();
+        if matches!(&app.source, DataSource::Sample) {
+            app.reload();
+        } else {
+            app.source_label = app.data_source_label().to_owned();
+            app.start_reload();
+        }
         app
     }
 
     pub fn next(&mut self) {
         let _ = advance_wrapped_index(&mut self.cursor, self.metrics.len(), 1);
+        self.refresh_history_for_selection();
     }
 
     pub fn previous(&mut self) {
         let _ = advance_wrapped_index(&mut self.cursor, self.metrics.len(), -1);
+        self.refresh_history_for_selection();
     }
 
     pub fn selected_metric(&self) -> Option<&MetricSample> {
@@ -175,6 +238,48 @@ impl App {
             .and_then(|metric| self.metric_history.get(&metric_key(metric)))
             .map(|values| values.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    pub fn history_range_label(&self) -> String {
+        match self.history_range {
+            HistoryRange::Live => String::from("live"),
+            HistoryRange::Window(seconds) if seconds % 3600 == 0 => {
+                format!("{}h", seconds / 3600)
+            }
+            HistoryRange::Window(seconds) => format!("{seconds}s"),
+        }
+    }
+
+    pub fn dashboard_label(&self) -> &str {
+        self.dashboard_selected
+            .and_then(|index| self.dashboards.get(index))
+            .map(|dashboard| dashboard.name.as_str())
+            .unwrap_or("-")
+    }
+
+    pub fn displayed_metric_histories(&self) -> Vec<(MetricSample, Vec<f64>)> {
+        let selected: Vec<_> = self
+            .metrics
+            .iter()
+            .filter(|metric| self.is_metric_selected(metric))
+            .collect();
+        let metrics = if selected.is_empty() {
+            self.selected_metric().into_iter().collect()
+        } else {
+            selected
+        };
+
+        metrics
+            .into_iter()
+            .map(|metric| {
+                let history = self
+                    .metric_history
+                    .get(&metric_key(metric))
+                    .map(|values| values.iter().copied().collect())
+                    .unwrap_or_default();
+                (metric.clone(), history)
+            })
+            .collect()
     }
 
     pub fn toggle_metric_selection(&mut self) {
@@ -189,11 +294,15 @@ impl App {
             self.selected_metrics.insert(key);
             self.status = format!("selected {name}");
         }
+        if let HistoryRange::Window(seconds) = self.history_range {
+            self.refresh_range_history(seconds);
+        }
     }
 
     pub fn clear_metric_selection(&mut self) {
         self.selected_metrics.clear();
         self.status = String::from("selection cleared");
+        self.refresh_history_for_selection();
     }
 
     pub fn is_metric_selected(&self, metric: &MetricSample) -> bool {
@@ -202,6 +311,14 @@ impl App {
 
     pub fn selected_metrics_len(&self) -> usize {
         self.selected_metrics.len()
+    }
+
+    fn refresh_history_for_selection(&mut self) {
+        if self.selected_metrics.is_empty() {
+            if let HistoryRange::Window(seconds) = self.history_range {
+                self.refresh_range_history(seconds);
+            }
+        }
     }
 
     pub fn next_target(&mut self) {
@@ -226,6 +343,18 @@ impl App {
 
     pub fn refresh_secs(&self) -> u64 {
         self.display.refresh_secs.unwrap_or(15)
+    }
+
+    pub fn refresh_state_label(&self) -> String {
+        if self.reload_in_progress {
+            return String::from("refreshing");
+        }
+        match (&self.last_successful_refresh, self.consecutive_failures) {
+            (Some(time), 0) => format!("ok@{time}"),
+            (Some(time), failures) => format!("stale@{time} ({failures} errors)"),
+            (None, failures) if failures > 0 => format!("failed ({failures})"),
+            _ => String::from("waiting"),
+        }
     }
 
     pub fn log_poll_secs(&self) -> u64 {
@@ -304,6 +433,183 @@ impl App {
         info!("cleared filter query");
     }
 
+    pub fn open_promql_input(&mut self) {
+        self.promql_input_open = true;
+        self.status = format!("PromQL: {}", self.promql_query);
+    }
+
+    pub fn cancel_promql_input(&mut self) {
+        self.promql_input_open = false;
+        self.update_loaded_status();
+    }
+
+    pub fn apply_promql_input(&mut self) {
+        self.promql_input_open = false;
+        self.dashboard_selected = None;
+        if self.promql_query.trim().is_empty() {
+            self.cancel_background_reload();
+            self.history_range = HistoryRange::Live;
+            self.reload();
+        } else {
+            self.execute_promql();
+        }
+    }
+
+    pub fn push_promql_char(&mut self, ch: char) {
+        self.promql_query.push(ch);
+        self.status = format!("PromQL: {}", self.promql_query);
+    }
+
+    pub fn pop_promql_char(&mut self) {
+        self.promql_query.pop();
+        self.status = format!("PromQL: {}", self.promql_query);
+    }
+
+    pub fn clear_promql(&mut self) {
+        self.promql_query.clear();
+        self.dashboard_selected = None;
+        self.status = String::from("PromQL: ");
+    }
+
+    pub fn next_dashboard(&mut self) {
+        if self.dashboards.is_empty() {
+            self.status = String::from("no dashboard presets configured");
+            return;
+        }
+        let next = self
+            .dashboard_selected
+            .map(|index| (index + 1) % self.dashboards.len())
+            .unwrap_or(0);
+        let dashboard = self.dashboards[next].clone();
+        self.dashboard_selected = Some(next);
+        self.promql_query = dashboard.query;
+        self.history_range = dashboard
+            .history_secs
+            .map(HistoryRange::Window)
+            .unwrap_or(HistoryRange::Live);
+        self.execute_promql();
+    }
+
+    pub fn set_history_range(&mut self, range: HistoryRange) {
+        self.cancel_background_reload();
+        self.history_range = range;
+        match range {
+            HistoryRange::Live => {
+                self.metric_history.clear();
+                self.record_metric_history();
+                self.status = String::from("history range: live");
+            }
+            HistoryRange::Window(seconds) => self.refresh_range_history(seconds),
+        }
+    }
+
+    fn execute_promql(&mut self) {
+        let query = self.promql_query.trim().to_owned();
+        if query.is_empty() {
+            self.reload();
+            return;
+        }
+        let DataSource::PrometheusApi { .. } = &self.source else {
+            self.status = String::from("PromQL requires a Prometheus data source");
+            return;
+        };
+        self.cancel_background_reload();
+        self.start_reload();
+    }
+
+    fn refresh_range_history(&mut self, _seconds: u64) {
+        let DataSource::PrometheusApi { .. } = &self.source else {
+            self.status = String::from("historical ranges require Prometheus");
+            return;
+        };
+        self.status = format!("loading {} history", self.history_range_label());
+        self.start_reload();
+    }
+
+    pub fn start_reload(&mut self) {
+        if self.reload_in_progress {
+            self.status = String::from("refresh already in progress");
+            return;
+        }
+        let DataSource::PrometheusApi { base_url, client } = &self.source else {
+            self.reload();
+            return;
+        };
+        let base_url = base_url.clone();
+        let client = client.clone();
+        let query = self.promql_query.trim().to_owned();
+        let selected_target = self.selected_target().clone();
+        let history_range = self.history_range;
+        let selected_metrics: Vec<MetricSample> = self
+            .displayed_metric_histories()
+            .into_iter()
+            .map(|(metric, _)| metric)
+            .collect();
+        let (sender, receiver) = mpsc::channel();
+        self.reload_receiver = Some(receiver);
+        self.reload_in_progress = true;
+        self.status = String::from("refreshing in background");
+
+        thread::spawn(move || {
+            let result = background_reload(
+                &base_url,
+                &client,
+                &query,
+                &selected_target,
+                history_range,
+                &selected_metrics,
+            );
+            let _ = sender.send(result);
+        });
+    }
+
+    fn cancel_background_reload(&mut self) {
+        self.reload_receiver = None;
+        self.reload_in_progress = false;
+    }
+
+    pub fn poll_background(&mut self) {
+        let result = match self.reload_receiver.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => {
+                Some(Err(String::from("refresh worker disconnected")))
+            }
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        if let Some(result) = result {
+            self.reload_receiver = None;
+            self.reload_in_progress = false;
+            match result {
+                Ok(payload) => {
+                    if let Some(targets) = payload.targets {
+                        let previous = TargetStateSnapshot {
+                            selected: payload.selected_target,
+                            cursor: None,
+                        };
+                        self.target_options = targets;
+                        let restore = self.restore_target_state(previous);
+                        self.apply_target_restore(restore);
+                    }
+                    self.set_metrics(payload.metrics);
+                    if let Some(histories) = payload.histories {
+                        self.metric_history = histories;
+                    }
+                    self.status = format!(
+                        "loaded {} metrics ({})",
+                        self.metrics.len(),
+                        self.history_range_label()
+                    );
+                }
+                Err(err) => {
+                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                    self.status = format!("refresh error (showing stale data): {err}");
+                }
+            }
+        }
+        self.poll_log_options_background();
+        self.poll_log_background();
+    }
+
     pub fn open_target_picker(&mut self) {
         self.target_picker_open = true;
         self.target_cursor = self.target_selected;
@@ -340,14 +646,31 @@ impl App {
             self.status = String::from("loki is not configured");
             return;
         }
+        let (correlated_host, correlated_log) = self.metric_log_correlation();
         self.filter_input_open = false;
         self.log_filter_input_open = false;
         self.target_picker_open = false;
         self.screen = ScreenMode::Logs;
         self.status = String::from("loading loki labels");
-        self.refresh_log_options();
-        self.restore_current_log_stream();
-        self.refresh_logs();
+        self.start_log_options_refresh(correlated_host, correlated_log);
+    }
+
+    fn metric_log_correlation(&self) -> (Option<String>, Option<String>) {
+        let correlated_host = self.loki.as_ref().and_then(|loki| {
+            self.selected_metric()
+                .and_then(|metric| label_value(metric, loki.metric_host_label()))
+                .map(str::to_owned)
+        });
+        let correlated_log = self.loki.as_ref().and_then(|loki| {
+            self.selected_metric()
+                .and_then(|metric| label_value(metric, loki.log_label()))
+                .or_else(|| {
+                    self.selected_metric()
+                        .and_then(|metric| label_value(metric, "job"))
+                })
+                .map(str::to_owned)
+        });
+        (correlated_host, correlated_log)
     }
 
     pub fn close_logs(&mut self) {
@@ -473,30 +796,120 @@ impl App {
         self.selected_log_entries.contains(&log_entry_key(entry))
     }
 
-    pub fn refresh_logs(&mut self) {
-        let Some(loki) = &self.loki else {
+    fn start_log_options_refresh(
+        &mut self,
+        preferred_host: Option<String>,
+        preferred_log: Option<String>,
+    ) {
+        if self.log_options_receiver.is_some() {
+            return;
+        }
+        let Some(loki) = self.loki.clone() else {
             self.status = String::from("loki is not configured");
             return;
         };
-        let host = self.selected_log_host().map(str::to_owned);
-        let log_name = self.selected_log_name().map(str::to_owned);
-        let (Some(host), Some(log_name)) = (host, log_name) else {
+        let (sender, receiver) = mpsc::channel();
+        self.log_options_receiver = Some(receiver);
+        thread::spawn(move || {
+            let result = (|| {
+                let hosts = loki.fetch_hosts()?;
+                let log_names = loki.fetch_logs()?;
+                Ok(LogOptionsPayload {
+                    hosts,
+                    log_names,
+                    preferred_host,
+                    preferred_log,
+                })
+            })();
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_log_options_background(&mut self) {
+        let result = match self.log_options_receiver.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => {
+                Some(Err(String::from("loki label worker disconnected")))
+            }
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.log_options_receiver = None;
+        match result {
+            Ok(payload) => {
+                self.log_hosts = payload.hosts;
+                self.log_names = payload.log_names;
+                self.log_host_selected = payload
+                    .preferred_host
+                    .and_then(|host| self.log_hosts.iter().position(|value| value == &host))
+                    .unwrap_or(0);
+                self.log_name_selected = payload
+                    .preferred_log
+                    .and_then(|name| self.log_names.iter().position(|value| value == &name))
+                    .unwrap_or(0);
+                self.restore_current_log_stream();
+                if self.is_logs_screen() {
+                    self.start_log_refresh();
+                }
+            }
+            Err(err) => self.status = format!("loki label error: {err}"),
+        }
+    }
+
+    pub fn start_log_refresh(&mut self) {
+        if self.log_options_receiver.is_some() {
+            return;
+        }
+        if self.log_reload_receiver.is_some() {
+            return;
+        }
+        let Some(loki) = self.loki.clone() else {
+            self.status = String::from("loki is not configured");
+            return;
+        };
+        let Some(key) = self.current_log_stream_key() else {
             self.status = String::from("no loki host/log labels available");
             return;
         };
+        let since = self.last_log_timestamp_ns;
+        let (sender, receiver) = mpsc::channel();
+        self.log_reload_receiver = Some(receiver);
+        let worker_key = key.clone();
+        thread::spawn(move || {
+            let result = loki.poll_logs(&worker_key.0, &worker_key.1, since);
+            let _ = sender.send((worker_key, result));
+        });
+    }
 
-        match loki.poll_logs(&host, &log_name, self.last_log_timestamp_ns) {
-            Ok(entries) => self.append_log_entries(entries),
-            Err(err) => {
-                self.status = format!("loki log fetch error: {err}");
+    fn poll_log_background(&mut self) {
+        let result = match self.log_reload_receiver.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => Some((
+                self.current_log_stream_key()
+                    .unwrap_or_else(|| (String::new(), String::new())),
+                Err(String::from("log refresh worker disconnected")),
+            )),
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some((key, result)) = result else {
+            return;
+        };
+        self.log_reload_receiver = None;
+        match result {
+            Ok(entries) if self.current_log_stream_key().as_ref() == Some(&key) => {
+                self.append_log_entries(entries)
             }
+            Ok(_) => {}
+            Err(err) => self.status = format!("loki log fetch error: {err}"),
         }
     }
 
     pub fn reload_logs_screen(&mut self) {
-        self.refresh_log_options();
-        self.restore_current_log_stream();
-        self.refresh_logs();
+        let preferred_host = self.selected_log_host().map(str::to_owned);
+        let preferred_log = self.selected_log_name().map(str::to_owned);
+        self.start_log_options_refresh(preferred_host, preferred_log);
     }
 
     fn advance_log_option(&mut self, step: isize) {
@@ -504,13 +917,13 @@ impl App {
             LogFocus::Hosts => {
                 if advance_wrapped_index(&mut self.log_host_selected, self.log_hosts.len(), step) {
                     self.restore_current_log_stream();
-                    self.refresh_logs();
+                    self.start_log_refresh();
                 }
             }
             LogFocus::Logs => {
                 if advance_wrapped_index(&mut self.log_name_selected, self.log_names.len(), step) {
                     self.restore_current_log_stream();
-                    self.refresh_logs();
+                    self.start_log_refresh();
                 }
             }
             LogFocus::Tail => {}
@@ -635,37 +1048,6 @@ impl App {
             .retain(|entry_key| visible_keys.contains(entry_key));
     }
 
-    fn refresh_log_options(&mut self) {
-        let Some(loki) = &self.loki else {
-            return;
-        };
-
-        match loki.fetch_hosts() {
-            Ok(hosts) => {
-                self.log_hosts = hosts;
-                if self.log_host_selected >= self.log_hosts.len() {
-                    self.log_host_selected = 0;
-                }
-            }
-            Err(err) => {
-                self.status = format!("loki host labels error: {err}");
-                return;
-            }
-        }
-
-        match loki.fetch_logs() {
-            Ok(log_names) => {
-                self.log_names = log_names;
-                if self.log_name_selected >= self.log_names.len() {
-                    self.log_name_selected = 0;
-                }
-            }
-            Err(err) => {
-                self.status = format!("loki log labels error: {err}");
-            }
-        }
-    }
-
     fn matches_log_filter_with(&self, needle: &str, entry: &LogEntry) -> bool {
         if needle.is_empty() {
             return true;
@@ -683,6 +1065,10 @@ impl App {
     }
 
     pub fn reload(&mut self) {
+        if !self.promql_query.trim().is_empty() {
+            self.execute_promql();
+            return;
+        }
         info!(source = %self.data_source_label(), "starting reload");
         match &self.source {
             DataSource::Sample => {
@@ -732,9 +1118,13 @@ impl App {
     fn set_metrics(&mut self, metrics: Vec<MetricSample>) {
         let previous_selection = self.selected_metric_key();
         self.all_metrics = metrics;
-        self.record_metric_history();
+        if self.history_range == HistoryRange::Live {
+            self.record_metric_history();
+        }
         self.refresh_target_options();
         self.rebuild_metrics_view(previous_selection.as_ref());
+        self.last_successful_refresh = Some(chrono::Local::now().format("%H:%M:%S").to_string());
+        self.consecutive_failures = 0;
         info!(
             loaded_metrics = self.all_metrics.len(),
             visible_metrics = self.metrics.len(),
@@ -759,6 +1149,10 @@ impl App {
     }
 
     fn apply_target_selection(&mut self) {
+        self.cancel_background_reload();
+        self.promql_query.clear();
+        self.dashboard_selected = None;
+        self.history_range = HistoryRange::Live;
         info!(target = %self.selected_target(), "applying target selection");
         match &self.source {
             DataSource::Sample => {
@@ -991,7 +1385,8 @@ impl App {
     {
         if let Err(err) = reload(self, base_url, client) {
             error!(%base_url, error = %err, "reload from prometheus failed");
-            self.reset_failed_state(format!("fetch error: {err}"));
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.status = format!("fetch error (showing stale data): {err}");
         }
     }
 }
@@ -1111,6 +1506,77 @@ fn fetch_targets(
     Ok(build_target_options(filters))
 }
 
+fn background_reload(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    query: &str,
+    selected_target: &TargetFilter,
+    history_range: HistoryRange,
+    selected_metrics: &[MetricSample],
+) -> Result<BackgroundReload, String> {
+    let (targets, effective_target, metrics) = if query.is_empty() {
+        let targets = fetch_targets(base_url, client)?;
+        let effective_target = targets
+            .iter()
+            .find(|target| *target == selected_target)
+            .cloned()
+            .unwrap_or_else(TargetFilter::wildcard);
+        let metrics = fetch_target_metrics(base_url, &effective_target, client)?;
+        (Some(targets), Some(effective_target), metrics)
+    } else {
+        (None, None, fetch_instant_query(base_url, query, client)?)
+    };
+
+    let histories = if let HistoryRange::Window(seconds) = history_range {
+        let step = (seconds / 60).max(1);
+        let queries: Vec<String> = if query.is_empty() {
+            let selected_keys: BTreeSet<_> = selected_metrics.iter().map(metric_key).collect();
+            let selected: Vec<_> = metrics
+                .iter()
+                .filter(|metric| selected_keys.contains(&metric_key(metric)))
+                .collect();
+            if selected.is_empty() {
+                metrics.iter().take(1).map(metric_selector).collect()
+            } else {
+                selected.into_iter().map(metric_selector).collect()
+            }
+        } else {
+            vec![query.to_owned()]
+        };
+        let mut result = BTreeMap::new();
+        for range_query in queries {
+            result.extend(fetch_query_range(
+                base_url,
+                &range_query,
+                seconds,
+                step,
+                client,
+            )?);
+        }
+        let normalized = result
+            .into_iter()
+            .map(|((name, labels), values)| {
+                let key = metrics
+                    .iter()
+                    .find(|metric| metric.labels == labels)
+                    .map(metric_key)
+                    .unwrap_or((name, labels));
+                (key, values)
+            })
+            .collect();
+        Some(normalized)
+    } else {
+        None
+    };
+
+    Ok(BackgroundReload {
+        targets,
+        selected_target: effective_target,
+        metrics,
+        histories,
+    })
+}
+
 fn fetch_target_metrics(
     base_url: &str,
     target: &TargetFilter,
@@ -1126,15 +1592,22 @@ fn fetch_target_metrics(
         )
     };
 
+    fetch_instant_query(base_url, &expr, client)
+}
+
+fn fetch_instant_query(
+    base_url: &str,
+    expr: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<Vec<MetricSample>, String> {
     let response = client
         .get(format!("{}/api/v1/query", base_url.trim_end_matches('/')))
-        .query(&[("query", expr.as_str())])
+        .query(&[("query", expr)])
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .map_err(|err| {
             error!(
                 %base_url,
-                target = %target,
                 query = %expr,
                 error = %err,
                 "prometheus metric request failed"
@@ -1144,7 +1617,6 @@ fn fetch_target_metrics(
     let response = response.error_for_status().map_err(|err| {
         error!(
             %base_url,
-            target = %target,
             query = %expr,
             error = %err,
             "prometheus metric response returned error status"
@@ -1154,7 +1626,6 @@ fn fetch_target_metrics(
     let payload: QueryResponse = response.json().map_err(|err| {
         error!(
             %base_url,
-            target = %target,
             error = %err,
             "failed to decode prometheus metric response"
         );
@@ -1164,7 +1635,6 @@ fn fetch_target_metrics(
     if payload.status != "success" {
         error!(
             %base_url,
-            target = %target,
             status = %payload.status,
             "prometheus metric query returned non-success status"
         );
@@ -1172,13 +1642,12 @@ fn fetch_target_metrics(
     }
 
     let data = payload.data.ok_or_else(|| {
-        error!(%base_url, target = %target, "prometheus metric response missing data");
+        error!(%base_url, "prometheus metric response missing data");
         String::from("missing response data")
     })?;
     if data.result_type != "vector" {
         error!(
             %base_url,
-            target = %target,
             result_type = %data.result_type,
             "unsupported prometheus result type"
         );
@@ -1208,6 +1677,94 @@ struct QueryData {
 struct QuerySample {
     metric: BTreeMap<String, String>,
     value: (f64, String),
+}
+
+#[derive(Debug, Deserialize)]
+struct RangeQueryResponse {
+    status: String,
+    data: Option<RangeQueryData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangeQueryData {
+    #[serde(rename = "resultType")]
+    result_type: String,
+    result: Vec<RangeQuerySeries>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangeQuerySeries {
+    metric: BTreeMap<String, String>,
+    values: Vec<(f64, String)>,
+}
+
+fn fetch_query_range(
+    base_url: &str,
+    query: &str,
+    range_secs: u64,
+    step_secs: u64,
+    client: &reqwest::blocking::Client,
+) -> Result<BTreeMap<MetricKey, VecDeque<f64>>, String> {
+    let end = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_secs();
+    let start = end.saturating_sub(range_secs);
+    let response = client
+        .get(format!(
+            "{}/api/v1/query_range",
+            base_url.trim_end_matches('/')
+        ))
+        .query(&[
+            ("query", query.to_owned()),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("step", step_secs.to_string()),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .map_err(|err| err.to_string())?
+        .error_for_status()
+        .map_err(|err| err.to_string())?;
+    let payload: RangeQueryResponse = response.json().map_err(|err| err.to_string())?;
+    if payload.status != "success" {
+        return Err(format!("query_range status {}", payload.status));
+    }
+    let data = payload
+        .data
+        .ok_or_else(|| String::from("missing query_range data"))?;
+    if data.result_type != "matrix" {
+        return Err(format!(
+            "unsupported range result type {}",
+            data.result_type
+        ));
+    }
+
+    data.result
+        .into_iter()
+        .map(|series| {
+            let name = series
+                .metric
+                .get("__name__")
+                .cloned()
+                .unwrap_or_else(|| query.to_owned());
+            let labels = series
+                .metric
+                .into_iter()
+                .filter(|(key, _)| key != "__name__")
+                .collect();
+            let values = series
+                .values
+                .into_iter()
+                .map(|(_, value)| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|_| String::from("invalid range sample value"))
+                })
+                .collect::<Result<VecDeque<_>, _>>()?;
+            Ok(((name, labels), values))
+        })
+        .collect()
 }
 
 impl QuerySample {
@@ -1264,6 +1821,19 @@ fn escape_matcher(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn metric_selector(metric: &MetricSample) -> String {
+    if metric.labels.is_empty() {
+        return metric.name.clone();
+    }
+    let labels = metric
+        .labels
+        .iter()
+        .map(|(key, value)| format!(r#"{key}="{}""#, escape_matcher(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}{{{labels}}}", metric.name)
+}
+
 fn label_value<'a>(metric: &'a MetricSample, key: &str) -> Option<&'a str> {
     metric
         .labels
@@ -1282,7 +1852,10 @@ fn log_entry_key(entry: &LogEntry) -> LogEntryKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, HistoryView, LogFocus, TargetFilter, HISTORY_LIMIT};
+    use super::{
+        metric_selector, App, HistoryRange, HistoryView, LogFocus, RangeQueryResponse,
+        TargetFilter, HISTORY_LIMIT,
+    };
     use crate::config::{DisplayConfig, PrometheusConfig};
     use crate::loki::LogEntry;
 
@@ -1918,5 +2491,91 @@ mod tests {
         app.toggle_history_view();
         assert_eq!(app.history_view, HistoryView::Graph);
         assert_eq!(app.status, "history view: graph");
+    }
+
+    #[test]
+    fn labels_live_and_window_history_ranges() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        assert_eq!(app.history_range_label(), "live");
+
+        app.history_range = HistoryRange::Window(6 * 3600);
+        assert_eq!(app.history_range_label(), "6h");
+    }
+
+    #[test]
+    fn builds_exact_promql_selector_for_metric() {
+        let metric = crate::prometheus::MetricSample {
+            name: String::from("up"),
+            labels: vec![
+                (String::from("job"), String::from("api")),
+                (String::from("instance"), String::from("a\"b")),
+            ],
+            value: 1.0,
+        };
+
+        assert_eq!(metric_selector(&metric), r#"up{job="api",instance="a\"b"}"#);
+    }
+
+    #[test]
+    fn exposes_all_marked_series_for_comparison() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        app.cursor = 0;
+        app.toggle_metric_selection();
+        app.cursor = 1;
+        app.toggle_metric_selection();
+
+        let series = app.displayed_metric_histories();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].1.len(), 1);
+        assert_eq!(series[1].1.len(), 1);
+    }
+
+    #[test]
+    fn keeps_metrics_when_background_refresh_fails() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+        let count = app.metrics.len();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.reload_receiver = Some(receiver);
+        app.reload_in_progress = true;
+        sender
+            .send(Err(String::from("temporary outage")))
+            .expect("result should be queued");
+
+        app.poll_background();
+
+        assert_eq!(app.metrics.len(), count);
+        assert!(app.status.contains("showing stale data"));
+        assert!(app.refresh_state_label().contains("errors"));
+    }
+
+    #[test]
+    fn derives_loki_selection_from_metric_labels() {
+        let app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+
+        assert_eq!(
+            app.metric_log_correlation(),
+            (
+                Some(String::from("localhost:9100")),
+                Some(String::from("node")),
+            )
+        );
+    }
+
+    #[test]
+    fn parses_prometheus_matrix_response() {
+        let payload: RangeQueryResponse = serde_json::from_str(
+            r#"{
+                "status":"success",
+                "data":{"resultType":"matrix","result":[{
+                    "metric":{"__name__":"up","job":"api"},
+                    "values":[[1710000000.0,"1"],[1710000060.0,"0"]]
+                }]}
+            }"#,
+        )
+        .expect("matrix response should parse");
+
+        let data = payload.data.expect("response data should exist");
+        assert_eq!(data.result_type, "matrix");
+        assert_eq!(data.result[0].values.len(), 2);
     }
 }

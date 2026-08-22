@@ -11,7 +11,7 @@ use std::io;
 use std::time::Duration;
 use std::time::Instant;
 
-use app::App;
+use app::{App, HistoryRange};
 use config::Config;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -63,24 +63,30 @@ fn run_app(
         refresh_secs = refresh_interval.as_secs(),
         "starting application"
     );
-    let mut app = App::with_loki(config.prometheus, config.loki, config.display);
+    let mut app = App::with_dashboards(
+        config.prometheus,
+        config.loki,
+        config.display,
+        config.dashboards,
+    );
     let mut last_reload = Instant::now();
     let mut last_log_poll = Instant::now();
 
     loop {
+        app.poll_background();
         if last_reload.elapsed() >= refresh_interval {
             info!(
                 refresh_secs = refresh_interval.as_secs(),
                 "automatic reload triggered"
             );
-            app.reload();
+            app.start_reload();
             last_reload = Instant::now();
         }
 
         if app.is_logs_screen()
             && last_log_poll.elapsed() >= Duration::from_secs(app.log_poll_secs())
         {
-            app.refresh_logs();
+            app.start_log_refresh();
             last_log_poll = Instant::now();
         }
 
@@ -102,6 +108,8 @@ fn run_app(
             handle_log_filter_key(&mut app, key)
         } else if app.is_logs_screen() {
             handle_log_key(&mut app, key)
+        } else if app.promql_input_open {
+            handle_promql_key(&mut app, key)
         } else if app.target_picker_open {
             handle_target_picker_key(&mut app, key)
         } else if app.filter_input_open {
@@ -259,6 +267,18 @@ fn handle_log_filter_key(app: &mut App, key: KeyEvent) -> AppAction {
     AppAction::Continue
 }
 
+fn handle_promql_key(app: &mut App, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Esc => app.cancel_promql_input(),
+        KeyCode::Enter => app.apply_promql_input(),
+        KeyCode::Backspace => app.pop_promql_char(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.clear_promql(),
+        KeyCode::Char(ch) => app.push_promql_char(ch),
+        _ => {}
+    }
+    AppAction::Continue
+}
+
 fn handle_main_key(app: &mut App, key: KeyEvent) -> AppAction {
     match key.code {
         KeyCode::Char('q') => return AppAction::Quit,
@@ -267,6 +287,12 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> AppAction {
         KeyCode::Char(' ') => app.toggle_metric_selection(),
         KeyCode::Char('c') => app.clear_metric_selection(),
         KeyCode::Char('h') => app.toggle_history_view(),
+        KeyCode::Char('p') => app.open_promql_input(),
+        KeyCode::Char('d') => app.next_dashboard(),
+        KeyCode::Char('1') => app.set_history_range(HistoryRange::Live),
+        KeyCode::Char('2') => app.set_history_range(HistoryRange::Window(3600)),
+        KeyCode::Char('3') => app.set_history_range(HistoryRange::Window(6 * 3600)),
+        KeyCode::Char('4') => app.set_history_range(HistoryRange::Window(24 * 3600)),
         KeyCode::Char('[') => app.previous_target(),
         KeyCode::Char(']') => app.next_target(),
         KeyCode::Char('t') => app.open_target_picker(),
@@ -277,11 +303,42 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> AppAction {
         KeyCode::Char('/') => app.open_filter_input(),
         KeyCode::Char('r') => {
             info!("manual reload triggered");
-            app.reload();
+            app.start_reload();
             return AppAction::Reloaded;
         }
         _ => {}
     }
 
     AppAction::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_main_key, handle_promql_key};
+    use crate::{
+        app::App,
+        config::{DisplayConfig, PrometheusConfig},
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn opens_and_edits_promql_input() {
+        let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
+
+        handle_main_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        handle_promql_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        handle_promql_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+
+        assert!(app.promql_input_open);
+        assert_eq!(app.promql_query, "up");
+    }
 }
