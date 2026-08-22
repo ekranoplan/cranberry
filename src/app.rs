@@ -1,9 +1,11 @@
 use crate::{
     config::{DashboardConfig, DisplayConfig, LokiConfig, PrometheusConfig},
     loki::{LogEntry, LokiClient},
-    prometheus::{parse_metrics, MetricSample},
+    prometheus::{
+        fetch_instant_query, fetch_query_range, fetch_target_metrics, fetch_targets, metric_key,
+        metric_selector, parse_metrics, MetricKey, MetricSample,
+    },
 };
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -1107,7 +1109,7 @@ impl App {
     ) -> Result<(), String> {
         let previous = self.capture_target_state();
         info!(%base_url, "fetching targets from prometheus");
-        let targets = fetch_targets(base_url, client)?;
+        let targets = fetch_target_options(base_url, client)?;
         info!(%base_url, targets = targets.len(), "fetched targets from prometheus");
         self.target_options = targets;
         let restore = self.restore_target_state(previous);
@@ -1176,7 +1178,9 @@ impl App {
     ) -> Result<(), String> {
         let previous_selection = self.selected_metric_key();
         info!(%base_url, target = %self.selected_target(), "fetching target metrics");
-        let metrics = fetch_target_metrics(base_url, self.selected_target(), client)?;
+        let target = self.selected_target();
+        let matcher = (target.job != "*").then_some((target.job.as_str(), target.target.as_str()));
+        let metrics = fetch_target_metrics(base_url, matcher, client)?;
         self.all_metrics = metrics;
         self.record_metric_history();
         self.rebuild_metrics_view(previous_selection.as_ref());
@@ -1391,8 +1395,6 @@ impl App {
     }
 }
 
-type MetricKey = (String, Vec<(String, String)>);
-
 impl TargetFilter {
     fn wildcard() -> Self {
         TargetFilter {
@@ -1471,41 +1473,6 @@ impl App {
     }
 }
 
-fn fetch_targets(
-    base_url: &str,
-    client: &reqwest::blocking::Client,
-) -> Result<Vec<TargetFilter>, String> {
-    let response = client
-        .get(format!("{}/api/v1/series", base_url.trim_end_matches('/')))
-        .query(&[("match[]", "up")])
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .map_err(|err| {
-            error!(%base_url, error = %err, "prometheus target request failed");
-            err.to_string()
-        })?;
-    let response = response.error_for_status().map_err(|err| {
-        error!(%base_url, error = %err, "prometheus target response returned error status");
-        err.to_string()
-    })?;
-    let payload: SeriesResponse = response.json().map_err(|err| {
-        error!(%base_url, error = %err, "failed to decode prometheus target response");
-        err.to_string()
-    })?;
-
-    if payload.status != "success" {
-        error!(%base_url, status = %payload.status, "prometheus target query returned non-success status");
-        return Err(format!("series status {}", payload.status));
-    }
-
-    let filters = payload.data.into_iter().filter_map(|series| {
-        let job = series.get("job")?.clone();
-        let target = series.get("instance")?.clone();
-        Some(TargetFilter { job, target })
-    });
-    Ok(build_target_options(filters))
-}
-
 fn background_reload(
     base_url: &str,
     client: &reqwest::blocking::Client,
@@ -1515,13 +1482,17 @@ fn background_reload(
     selected_metrics: &[MetricSample],
 ) -> Result<BackgroundReload, String> {
     let (targets, effective_target, metrics) = if query.is_empty() {
-        let targets = fetch_targets(base_url, client)?;
+        let targets = fetch_target_options(base_url, client)?;
         let effective_target = targets
             .iter()
             .find(|target| *target == selected_target)
             .cloned()
             .unwrap_or_else(TargetFilter::wildcard);
-        let metrics = fetch_target_metrics(base_url, &effective_target, client)?;
+        let matcher = (effective_target.job != "*").then_some((
+            effective_target.job.as_str(),
+            effective_target.target.as_str(),
+        ));
+        let metrics = fetch_target_metrics(base_url, matcher, client)?;
         (Some(targets), Some(effective_target), metrics)
     } else {
         (None, None, fetch_instant_query(base_url, query, client)?)
@@ -1577,228 +1548,17 @@ fn background_reload(
     })
 }
 
-fn fetch_target_metrics(
+fn fetch_target_options(
     base_url: &str,
-    target: &TargetFilter,
     client: &reqwest::blocking::Client,
-) -> Result<Vec<MetricSample>, String> {
-    let expr = if target.job == "*" {
-        String::from("{job!=\"\"}")
-    } else {
-        format!(
-            "{{job=\"{}\",instance=\"{}\"}}",
-            escape_matcher(&target.job),
-            escape_matcher(&target.target)
-        )
-    };
-
-    fetch_instant_query(base_url, &expr, client)
-}
-
-fn fetch_instant_query(
-    base_url: &str,
-    expr: &str,
-    client: &reqwest::blocking::Client,
-) -> Result<Vec<MetricSample>, String> {
-    let response = client
-        .get(format!("{}/api/v1/query", base_url.trim_end_matches('/')))
-        .query(&[("query", expr)])
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .map_err(|err| {
-            error!(
-                %base_url,
-                query = %expr,
-                error = %err,
-                "prometheus metric request failed"
-            );
-            err.to_string()
-        })?;
-    let response = response.error_for_status().map_err(|err| {
-        error!(
-            %base_url,
-            query = %expr,
-            error = %err,
-            "prometheus metric response returned error status"
-        );
-        err.to_string()
-    })?;
-    let payload: QueryResponse = response.json().map_err(|err| {
-        error!(
-            %base_url,
-            error = %err,
-            "failed to decode prometheus metric response"
-        );
-        err.to_string()
-    })?;
-
-    if payload.status != "success" {
-        error!(
-            %base_url,
-            status = %payload.status,
-            "prometheus metric query returned non-success status"
-        );
-        return Err(format!("query status {}", payload.status));
-    }
-
-    let data = payload.data.ok_or_else(|| {
-        error!(%base_url, "prometheus metric response missing data");
-        String::from("missing response data")
-    })?;
-    if data.result_type != "vector" {
-        error!(
-            %base_url,
-            result_type = %data.result_type,
-            "unsupported prometheus result type"
-        );
-        return Err(format!("unsupported result type {}", data.result_type));
-    }
-
-    data.result
+) -> Result<Vec<TargetFilter>, String> {
+    let targets = fetch_targets(base_url, client)?
         .into_iter()
-        .map(QuerySample::into_metric_sample)
-        .collect()
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryResponse {
-    status: String,
-    data: Option<QueryData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryData {
-    #[serde(rename = "resultType")]
-    result_type: String,
-    result: Vec<QuerySample>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuerySample {
-    metric: BTreeMap<String, String>,
-    value: (f64, String),
-}
-
-#[derive(Debug, Deserialize)]
-struct RangeQueryResponse {
-    status: String,
-    data: Option<RangeQueryData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RangeQueryData {
-    #[serde(rename = "resultType")]
-    result_type: String,
-    result: Vec<RangeQuerySeries>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RangeQuerySeries {
-    metric: BTreeMap<String, String>,
-    values: Vec<(f64, String)>,
-}
-
-fn fetch_query_range(
-    base_url: &str,
-    query: &str,
-    range_secs: u64,
-    step_secs: u64,
-    client: &reqwest::blocking::Client,
-) -> Result<BTreeMap<MetricKey, VecDeque<f64>>, String> {
-    let end = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|err| err.to_string())?
-        .as_secs();
-    let start = end.saturating_sub(range_secs);
-    let response = client
-        .get(format!(
-            "{}/api/v1/query_range",
-            base_url.trim_end_matches('/')
-        ))
-        .query(&[
-            ("query", query.to_owned()),
-            ("start", start.to_string()),
-            ("end", end.to_string()),
-            ("step", step_secs.to_string()),
-        ])
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .map_err(|err| err.to_string())?
-        .error_for_status()
-        .map_err(|err| err.to_string())?;
-    let payload: RangeQueryResponse = response.json().map_err(|err| err.to_string())?;
-    if payload.status != "success" {
-        return Err(format!("query_range status {}", payload.status));
-    }
-    let data = payload
-        .data
-        .ok_or_else(|| String::from("missing query_range data"))?;
-    if data.result_type != "matrix" {
-        return Err(format!(
-            "unsupported range result type {}",
-            data.result_type
-        ));
-    }
-
-    data.result
-        .into_iter()
-        .map(|series| {
-            let name = series
-                .metric
-                .get("__name__")
-                .cloned()
-                .unwrap_or_else(|| query.to_owned());
-            let labels = series
-                .metric
-                .into_iter()
-                .filter(|(key, _)| key != "__name__")
-                .collect();
-            let values = series
-                .values
-                .into_iter()
-                .map(|(_, value)| {
-                    value
-                        .parse::<f64>()
-                        .map_err(|_| String::from("invalid range sample value"))
-                })
-                .collect::<Result<VecDeque<_>, _>>()?;
-            Ok(((name, labels), values))
-        })
-        .collect()
-}
-
-impl QuerySample {
-    fn into_metric_sample(self) -> Result<MetricSample, String> {
-        let value = self
-            .value
-            .1
-            .parse::<f64>()
-            .map_err(|_| String::from("invalid sample value"))?;
-
-        let name = self
-            .metric
-            .get("__name__")
-            .cloned()
-            .unwrap_or_else(|| String::from("unknown"));
-
-        let labels: Vec<(String, String)> = self
-            .metric
-            .into_iter()
-            .filter(|(key, _)| key != "__name__")
-            .collect();
-
-        Ok(MetricSample {
-            name,
-            labels,
-            value,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SeriesResponse {
-    status: String,
-    data: Vec<BTreeMap<String, String>>,
+        .map(|target| TargetFilter {
+            job: target.job,
+            target: target.target,
+        });
+    Ok(build_target_options(targets))
 }
 
 fn build_target_options(targets: impl Iterator<Item = TargetFilter>) -> Vec<TargetFilter> {
@@ -1817,23 +1577,6 @@ fn build_target_options(targets: impl Iterator<Item = TargetFilter>) -> Vec<Targ
     options
 }
 
-fn escape_matcher(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn metric_selector(metric: &MetricSample) -> String {
-    if metric.labels.is_empty() {
-        return metric.name.clone();
-    }
-    let labels = metric
-        .labels
-        .iter()
-        .map(|(key, value)| format!(r#"{key}="{}""#, escape_matcher(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{}{{{labels}}}", metric.name)
-}
-
 fn label_value<'a>(metric: &'a MetricSample, key: &str) -> Option<&'a str> {
     metric
         .labels
@@ -1842,20 +1585,13 @@ fn label_value<'a>(metric: &'a MetricSample, key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn metric_key(metric: &MetricSample) -> MetricKey {
-    (metric.name.clone(), metric.labels.clone())
-}
-
 fn log_entry_key(entry: &LogEntry) -> LogEntryKey {
     (entry.timestamp_ns, entry.line.clone())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        metric_selector, App, HistoryRange, HistoryView, LogFocus, RangeQueryResponse,
-        TargetFilter, HISTORY_LIMIT,
-    };
+    use super::{App, HistoryRange, HistoryView, LogFocus, TargetFilter, HISTORY_LIMIT};
     use crate::config::{DisplayConfig, PrometheusConfig};
     use crate::loki::LogEntry;
 
@@ -2503,20 +2239,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_exact_promql_selector_for_metric() {
-        let metric = crate::prometheus::MetricSample {
-            name: String::from("up"),
-            labels: vec![
-                (String::from("job"), String::from("api")),
-                (String::from("instance"), String::from("a\"b")),
-            ],
-            value: 1.0,
-        };
-
-        assert_eq!(metric_selector(&metric), r#"up{job="api",instance="a\"b"}"#);
-    }
-
-    #[test]
     fn exposes_all_marked_series_for_comparison() {
         let mut app = App::new(PrometheusConfig::default(), DisplayConfig::default());
         app.cursor = 0;
@@ -2559,23 +2281,5 @@ mod tests {
                 Some(String::from("node")),
             )
         );
-    }
-
-    #[test]
-    fn parses_prometheus_matrix_response() {
-        let payload: RangeQueryResponse = serde_json::from_str(
-            r#"{
-                "status":"success",
-                "data":{"resultType":"matrix","result":[{
-                    "metric":{"__name__":"up","job":"api"},
-                    "values":[[1710000000.0,"1"],[1710000060.0,"0"]]
-                }]}
-            }"#,
-        )
-        .expect("matrix response should parse");
-
-        let data = payload.data.expect("response data should exist");
-        assert_eq!(data.result_type, "matrix");
-        assert_eq!(data.result[0].values.len(), 2);
     }
 }
