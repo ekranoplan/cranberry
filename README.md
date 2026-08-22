@@ -43,6 +43,7 @@ host_label = "host"
 log_label = "job"
 poll_secs = 1
 lookback_secs = 1200
+metric_host_label = "instance"
 
 [display]
 max_metrics = 20
@@ -52,6 +53,11 @@ refresh_secs = 15
 [logging]
 path = "cranberry.log"
 level = "info"
+
+[[dashboard]]
+name = "HTTP errors"
+query = "sum by (job) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+history_secs = 3600
 ```
 
 Supported options:
@@ -65,6 +71,8 @@ Supported options:
 - `loki.log_label`: Label name used for log selection. Defaults to `job`
 - `loki.poll_secs`: Poll interval for log updates in seconds. Defaults to `1`
 - `loki.lookback_secs`: Initial log lookback window in seconds. Defaults to `1200`
+- `loki.metric_host_label`: Prometheus label mapped to the Loki host when opening logs. Defaults to `instance`
+- `[[dashboard]]`: Repeatable PromQL preset with `name`, `query`, and optional `history_secs`
 - `logging.path`: Log file path. Defaults to `cranberry.log`
 - `logging.level`: Log verbosity. One of `trace`, `debug`, `info`, `warn`, `error`. Defaults to `info`
 
@@ -79,6 +87,11 @@ If `prometheus.base_url` is omitted, Cranberry starts with built-in sample metri
 - `l`: Open Loki log viewer
 - `/`: Open metric filter input
 - `r`: Reload immediately
+- `Space`: Select metrics for comparison
+- `h`: Toggle graph and comparison table
+- `1` / `2` / `3` / `4`: Select live / 1h / 6h / 24h history
+- `p`: Enter and execute arbitrary PromQL
+- `d`: Cycle configured dashboard presets
 - `Tab` / `h` / `l` in log view: Switch between host and log pickers
 - `Esc`: Close target picker, filter input, or log view
 - `Enter`: Apply target picker selection or close filter input

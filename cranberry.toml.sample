@@ -7,6 +7,7 @@ host_label = "host"
 log_label = "job"
 poll_secs = 1
 lookback_secs = 1200
+metric_host_label = "instance"
 
 [display]
 initial_metric = "up"
@@ -15,3 +16,8 @@ refresh_secs = 15
 [logging]
 path = "cranberry.log"
 level = "info"
+
+[[dashboard]]
+name = "HTTP errors"
+query = "sum by (job) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+history_secs = 3600
